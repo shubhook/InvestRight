@@ -1,0 +1,8 @@
+Flask
+python-dotenv
+yfinance
+requests
+pandas
+numpy
+schedule
+feedparser
