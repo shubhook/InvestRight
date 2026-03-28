@@ -1,6 +1,8 @@
 import os
 import re
+import uuid
 import traceback
+import threading
 from dotenv import load_dotenv
 load_dotenv()  # Must run before any module that reads env vars at import time
 from flask import Flask, request, jsonify
@@ -485,6 +487,197 @@ def portfolio_pnl_daily():
     """Today's P&L summary."""
     from portfolio.pnl_calculator import get_daily_pnl
     return jsonify(get_daily_pnl())
+
+
+# ---------------------------------------------------------------------------
+# Backtest endpoints
+# ---------------------------------------------------------------------------
+
+def _create_backtest_run_row(run_id, symbol, start_date, end_date, interval, initial_capital):
+    """Insert a backtest_runs row so the run_id is valid before the thread starts."""
+    from db.connection import db_cursor
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO backtest_runs
+                (run_id, symbol, start_date, end_date, interval, initial_capital, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'running')
+            """,
+            (run_id, symbol, start_date, end_date, interval, initial_capital),
+        )
+
+
+def _backtest_thread(run_id, symbol, start_date, end_date, interval, initial_capital):
+    """Background thread: load data then run the backtest engine."""
+    from backtest.data_loader import load_historical_data
+    from backtest.backtest_engine import run_backtest, _update_run_status
+
+    ohlc_df = load_historical_data(symbol, start_date, end_date, interval=interval)
+    if ohlc_df is None or ohlc_df.empty:
+        _update_run_status(run_id, "failed", error="Failed to load historical data")
+        return
+
+    run_backtest(run_id=run_id, symbol=symbol, ohlc_df=ohlc_df, initial_capital=initial_capital)
+
+
+@app.route("/backtest/run", methods=["POST"])
+@require_auth
+def backtest_run():
+    """
+    Launch an async backtest.  Returns run_id immediately; check status via
+    GET /backtest/runs/<run_id>.
+
+    Required JSON body:
+        symbol          (str)   e.g. "RELIANCE.NS"
+        start_date      (str)   "YYYY-MM-DD"
+        end_date        (str)   "YYYY-MM-DD"
+        interval        (str)   optional, default "1d"
+        initial_capital (float) optional, default from BACKTEST_DEFAULT_CAPITAL
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        symbol = (body.get("symbol") or "").strip().upper()
+        if not symbol:
+            return jsonify({"error": "symbol is required"}), 400
+        if not re.match(r"^[A-Z0-9.\-]{1,20}$", symbol):
+            return jsonify({"error": "Invalid symbol format"}), 400
+
+        start_date = body.get("start_date", "")
+        end_date   = body.get("end_date",   "")
+        if not start_date or not end_date:
+            return jsonify({"error": "start_date and end_date are required"}), 400
+
+        interval        = body.get("interval", "1d")
+        default_capital = float(os.getenv("BACKTEST_DEFAULT_CAPITAL", 100000.0))
+        initial_capital = float(body.get("initial_capital", default_capital))
+
+        run_id = str(uuid.uuid4())
+        _create_backtest_run_row(run_id, symbol, start_date, end_date, interval, initial_capital)
+
+        t = threading.Thread(
+            target=_backtest_thread,
+            args=(run_id, symbol, start_date, end_date, interval, initial_capital),
+            daemon=True,
+        )
+        t.start()
+
+        logger.info(f"[API] Backtest launched: run_id={run_id} symbol={symbol}")
+        return jsonify({"run_id": run_id, "status": "running", "symbol": symbol}), 202
+
+    except Exception as e:
+        logger.error(f"[API] /backtest/run error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
+
+@app.route("/backtest/runs", methods=["GET"])
+@require_auth
+def backtest_list_runs():
+    """Return paginated list of all backtest runs."""
+    from backtest.report_generator import list_runs
+    limit  = min(int(request.args.get("limit",  50)), 200)
+    offset = int(request.args.get("offset", 0))
+    return jsonify(list_runs(limit=limit, offset=offset))
+
+
+@app.route("/backtest/runs/<run_id>", methods=["GET"])
+@require_auth
+def backtest_get_run(run_id):
+    """Return full summary for a single backtest run."""
+    from backtest.report_generator import generate_summary
+    summary = generate_summary(run_id)
+    if summary is None:
+        return jsonify({"error": "Backtest run not found"}), 404
+    return jsonify(summary)
+
+
+@app.route("/backtest/runs/<run_id>/trades", methods=["GET"])
+@require_auth
+def backtest_run_trades(run_id):
+    """Return trade-by-trade breakdown for a run."""
+    from backtest.report_generator import get_trade_breakdown
+    return jsonify({"run_id": run_id, "trades": get_trade_breakdown(run_id)})
+
+
+@app.route("/backtest/runs/<run_id>/equity-curve", methods=["GET"])
+@require_auth
+def backtest_equity_curve(run_id):
+    """Return the equity curve for a run."""
+    from backtest.report_generator import get_equity_curve
+    return jsonify({"run_id": run_id, "equity_curve": get_equity_curve(run_id)})
+
+
+@app.route("/backtest/compare", methods=["POST"])
+@require_auth
+def backtest_compare():
+    """
+    Compare multiple runs side-by-side.
+
+    JSON body: { "run_ids": ["<uuid>", "<uuid>", ...] }
+    """
+    try:
+        body    = request.get_json(silent=True) or {}
+        run_ids = body.get("run_ids", [])
+        if not run_ids or not isinstance(run_ids, list):
+            return jsonify({"error": "run_ids list is required"}), 400
+
+        from backtest.report_generator import generate_comparison
+        return jsonify(generate_comparison(run_ids))
+
+    except Exception as e:
+        logger.error(f"[API] /backtest/compare error: {e}")
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
+
+@app.route("/backtest/walk-forward", methods=["POST"])
+@require_auth
+def backtest_walk_forward():
+    """
+    Run walk-forward validation (synchronous — may take several minutes).
+
+    Required JSON body:
+        symbol          (str)
+        start_date      (str)   "YYYY-MM-DD"
+        end_date        (str)   "YYYY-MM-DD"
+        interval        (str)   optional, default "1d"
+        initial_capital (float) optional
+        n_splits        (int)   optional, default 5
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        symbol = (body.get("symbol") or "").strip().upper()
+        if not symbol:
+            return jsonify({"error": "symbol is required"}), 400
+
+        start_date = body.get("start_date", "")
+        end_date   = body.get("end_date",   "")
+        if not start_date or not end_date:
+            return jsonify({"error": "start_date and end_date are required"}), 400
+
+        interval        = body.get("interval", "1d")
+        default_capital = float(os.getenv("BACKTEST_DEFAULT_CAPITAL", 100000.0))
+        initial_capital = float(body.get("initial_capital", default_capital))
+        n_splits        = int(body.get("n_splits", 5))
+
+        from backtest.data_loader import load_historical_data
+        from backtest.walk_forward import run_walk_forward
+
+        ohlc_df = load_historical_data(symbol, start_date, end_date, interval=interval)
+        if ohlc_df is None or ohlc_df.empty:
+            return jsonify({"error": "Failed to load historical data for symbol"}), 422
+
+        result = run_walk_forward(
+            symbol=symbol,
+            ohlc_df=ohlc_df,
+            initial_capital=initial_capital,
+            n_splits=n_splits,
+        )
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"[API] /backtest/walk-forward error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------

@@ -176,3 +176,49 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
     created_at       TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (snapshot_date)
 );
+
+-- Backtesting tables — isolated from live tables
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    run_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    symbol          VARCHAR(20) NOT NULL,
+    start_date      DATE NOT NULL,
+    end_date        DATE NOT NULL,
+    interval        VARCHAR(20) NOT NULL DEFAULT '15m',
+    initial_capital NUMERIC(15, 2) NOT NULL,
+    status          VARCHAR(20) NOT NULL DEFAULT 'running'
+                    CHECK (status IN ('running', 'completed', 'failed')),
+    metrics         JSONB,
+    error_message   TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    completed_at    TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS backtest_trades (
+    id              SERIAL PRIMARY KEY,
+    run_id          UUID NOT NULL REFERENCES backtest_runs(run_id) ON DELETE CASCADE,
+    bar_index       INTEGER NOT NULL,
+    symbol          VARCHAR(20) NOT NULL,
+    action          VARCHAR(10) NOT NULL CHECK (action IN ('BUY', 'SELL')),
+    entry_price     NUMERIC(12, 4) NOT NULL,
+    exit_price      NUMERIC(12, 4),
+    stop_loss       NUMERIC(12, 4),
+    target          NUMERIC(12, 4),
+    quantity        INTEGER,
+    pnl             NUMERIC(15, 2),
+    exit_reason     VARCHAR(20),
+    result          VARCHAR(10) CHECK (result IN ('correct', 'wrong', 'pending')),
+    entry_bar_time  TIMESTAMPTZ,
+    exit_bar_time   TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_bt_trades_run_id ON backtest_trades(run_id);
+
+CREATE TABLE IF NOT EXISTS backtest_equity_curve (
+    id              SERIAL PRIMARY KEY,
+    run_id          UUID NOT NULL REFERENCES backtest_runs(run_id) ON DELETE CASCADE,
+    bar_index       INTEGER NOT NULL,
+    bar_time        TIMESTAMPTZ,
+    equity          NUMERIC(15, 2) NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bt_equity_run_id ON backtest_equity_curve(run_id);

@@ -26,6 +26,9 @@ if not API_KEY:
 if not TOTAL_CAPITAL:
     raise EnvironmentError("TOTAL_CAPITAL environment variable is not set or is zero.")
 
+BACKTEST_DEFAULT_CAPITAL = float(os.getenv('BACKTEST_DEFAULT_CAPITAL', 100000.0))
+BACKTEST_MAX_WORKERS     = int(os.getenv('BACKTEST_MAX_WORKERS', 4))
+
 class Config:
     STOCK_API_KEY = os.getenv('API_KEY_STOCK')
     NEWS_API_KEY = os.getenv('API_KEY_NEWS')
