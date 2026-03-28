@@ -1,5 +1,3 @@
-import json
-from datetime import datetime
 from utils.logger import setup_logger
 from memory.memory_reader import get_trade, update_trade_result
 
@@ -98,7 +96,7 @@ def evaluate(trade_id: str, current_price: float) -> dict:
             "result": result,
             "message": message
         }
-        
+
     except Exception as e:
         logger.error(f"[FEEDBACK] Error in feedback agent: {str(e)}")
         return {
@@ -106,3 +104,55 @@ def evaluate(trade_id: str, current_price: float) -> dict:
             "result": "pending",
             "message": f"Feedback engine error: {str(e)}"
         }
+
+
+def record_outcome(trade_id: str, exit_price: float, exit_reason: str) -> dict:
+    """
+    Record the final outcome of a trade after a confirmed exit.
+    Called by exit_monitor after position is closed.
+
+    exit_reason: "target_hit" | "stop_hit" | "manual"
+
+    Returns: {"trade_id": str, "result": "correct"|"wrong"|"pending", "message": str}
+    """
+    try:
+        trade = get_trade(trade_id)
+        if not trade:
+            logger.error(f"[FEEDBACK] record_outcome: trade not found {trade_id}")
+            return {"trade_id": trade_id, "result": "pending", "message": "Trade not found"}
+
+        # Already resolved — don't overwrite
+        if trade.get("result") in ("correct", "wrong"):
+            return {"trade_id": trade_id, "result": trade["result"],
+                    "message": f"Already evaluated as {trade['result']}"}
+
+        action = trade.get("action")
+
+        if exit_reason == "target_hit":
+            result = "correct"
+        elif exit_reason == "stop_hit":
+            result = "wrong"
+        else:
+            # Manual close — evaluate by price vs entry
+            entry     = trade.get("entry") or 0.0
+            stop_loss = trade.get("stop_loss") or 0.0
+            target    = trade.get("target") or 0.0
+            if action == "BUY":
+                result = "correct" if exit_price >= target else "wrong" if exit_price <= stop_loss else "pending"
+            elif action == "SELL":
+                result = "correct" if exit_price <= target else "wrong" if exit_price >= stop_loss else "pending"
+            else:
+                result = "pending"
+
+        if result in ("correct", "wrong"):
+            update_trade_result(trade_id, result)
+            logger.info(f"[FEEDBACK] Trade {trade_id} outcome recorded: {result} (exit={exit_reason})")
+
+        return {
+            "trade_id": trade_id,
+            "result":   result,
+            "message":  f"Outcome recorded: {result} via {exit_reason}",
+        }
+    except Exception as e:
+        logger.error(f"[FEEDBACK] record_outcome error: {e}")
+        return {"trade_id": trade_id, "result": "pending", "message": str(e)}

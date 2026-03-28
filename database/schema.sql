@@ -122,3 +122,57 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS idx_orders_trade_id ON orders(trade_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status   ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_symbol   ON orders(symbol);
+
+-- Capital account — single source of truth for money
+CREATE TABLE IF NOT EXISTS capital_account (
+    id                  SERIAL PRIMARY KEY,
+    total_capital       NUMERIC(15, 2) NOT NULL,
+    deployed_capital    NUMERIC(15, 2) NOT NULL DEFAULT 0.00,
+    available_capital   NUMERIC(15, 2) NOT NULL,
+    realised_pnl        NUMERIC(15, 2) NOT NULL DEFAULT 0.00,
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Drop and recreate positions with full schema (replaces Batch 1 placeholder)
+DROP TABLE IF EXISTS positions CASCADE;
+
+CREATE TABLE IF NOT EXISTS positions (
+    position_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    trade_id            UUID REFERENCES trades(trade_id),
+    order_id            VARCHAR(50) REFERENCES orders(order_id),
+    symbol              VARCHAR(20) NOT NULL,
+    action              VARCHAR(10) NOT NULL CHECK (action IN ('BUY', 'SELL')),
+    quantity            INTEGER NOT NULL,
+    entry_price         NUMERIC(12, 4) NOT NULL,
+    current_price       NUMERIC(12, 4),
+    stop_loss           NUMERIC(12, 4) NOT NULL,
+    target              NUMERIC(12, 4) NOT NULL,
+    unrealised_pnl      NUMERIC(15, 2) DEFAULT 0.00,
+    realised_pnl        NUMERIC(15, 2),
+    exit_price          NUMERIC(12, 4),
+    exit_reason         VARCHAR(50),
+    status              VARCHAR(10) NOT NULL DEFAULT 'open'
+                        CHECK (status IN ('open', 'closed')),
+    capital_deployed    NUMERIC(15, 2) NOT NULL,
+    opened_at           TIMESTAMPTZ DEFAULT NOW(),
+    closed_at           TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_symbol   ON positions(symbol);
+CREATE INDEX IF NOT EXISTS idx_positions_status   ON positions(status);
+CREATE INDEX IF NOT EXISTS idx_positions_trade_id ON positions(trade_id);
+
+-- P&L snapshots — daily portfolio valuation history
+CREATE TABLE IF NOT EXISTS pnl_snapshots (
+    snapshot_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    snapshot_date    DATE NOT NULL,
+    total_capital    NUMERIC(15, 2) NOT NULL,
+    deployed_capital NUMERIC(15, 2) NOT NULL,
+    available_capital NUMERIC(15, 2) NOT NULL,
+    unrealised_pnl   NUMERIC(15, 2) NOT NULL,
+    realised_pnl     NUMERIC(15, 2) NOT NULL,
+    open_positions   INTEGER NOT NULL,
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (snapshot_date)
+);

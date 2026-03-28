@@ -36,6 +36,15 @@ def init_db():
         print(f"ERROR: Failed to initialise database: {e}")
         sys.exit(1)
 
+    # Seed capital account (idempotent — does nothing if already seeded)
+    try:
+        from portfolio.capital_account import initialise
+        initialise()
+        total = float(os.getenv("TOTAL_CAPITAL", 0))
+        print(f"SUCCESS: Capital account ready — ₹{total:,.2f} available.")
+    except Exception as e:
+        print(f"WARNING: Capital account seed failed: {e}")
+
 
 if __name__ == "__main__":
     init_db()

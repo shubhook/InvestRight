@@ -388,6 +388,106 @@ def broker_status():
 
 
 # ---------------------------------------------------------------------------
+# Portfolio endpoints
+# ---------------------------------------------------------------------------
+
+@app.route("/portfolio", methods=["GET"])
+@require_auth
+def portfolio():
+    """Full portfolio summary — capital, P&L, positions, trade stats."""
+    from portfolio.pnl_calculator import get_portfolio_summary
+    return jsonify(get_portfolio_summary())
+
+
+@app.route("/portfolio/positions", methods=["GET"])
+@require_auth
+def portfolio_positions():
+    """All open positions with current P&L."""
+    from portfolio.position_manager import get_open_positions
+    positions = get_open_positions()
+    total_unrealised = sum(
+        float(p.get("unrealised_pnl") or 0) for p in positions
+    )
+    return jsonify({
+        "positions":           positions,
+        "total_open":          len(positions),
+        "total_unrealised_pnl": round(total_unrealised, 2),
+    })
+
+
+@app.route("/portfolio/positions/<position_id>", methods=["GET"])
+@require_auth
+def portfolio_position(position_id):
+    """Single position P&L detail."""
+    from portfolio.pnl_calculator import get_position_pnl
+    result = get_position_pnl(position_id)
+    if result is None:
+        return jsonify({"error": "Position not found"}), 404
+    return jsonify(result)
+
+
+@app.route("/portfolio/positions/<position_id>/close", methods=["POST"])
+@require_auth
+def close_position_manual(position_id):
+    """
+    Manually close a position.
+    Kill switch does NOT block manual closes — exits must always work.
+    """
+    try:
+        from portfolio.position_manager import get_position, close_position
+        from broker.broker_factory import get_broker
+
+        position = get_position(position_id)
+        if position is None:
+            return jsonify({"error": "Position not found"}), 404
+
+        if position.get("status") == "closed":
+            return jsonify({"error": "Position already closed"}), 400
+
+        body        = request.get_json(silent=True) or {}
+        exit_reason = body.get("reason", "manual")
+        symbol      = position["symbol"]
+
+        broker = get_broker()
+        ltp    = broker.get_ltp(symbol)
+        if ltp is None:
+            ltp = float(position["current_price"] or position["entry_price"])
+            logger.warning(f"[API] LTP unavailable for manual close of {symbol} — using last known price")
+
+        closed = close_position(position_id, ltp, exit_reason)
+        if closed is None:
+            return jsonify({"error": "Failed to close position"}), 500
+
+        # Record trade outcome
+        from agents.feedback_agent import record_outcome
+        if position.get("trade_id"):
+            record_outcome(position["trade_id"], ltp, exit_reason)
+
+        return jsonify(closed)
+
+    except Exception as e:
+        logger.error(f"[API] /portfolio/positions/{position_id}/close error: {e}")
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
+
+@app.route("/portfolio/pnl", methods=["GET"])
+@require_auth
+def portfolio_pnl():
+    """Full P&L breakdown."""
+    from portfolio.pnl_calculator import get_portfolio_summary
+    summary = get_portfolio_summary()
+    return jsonify(summary["pnl"])
+
+
+@app.route("/portfolio/pnl/daily", methods=["GET"])
+@require_auth
+def portfolio_pnl_daily():
+    """Today's P&L summary."""
+    from portfolio.pnl_calculator import get_daily_pnl
+    return jsonify(get_daily_pnl())
+
+
+# ---------------------------------------------------------------------------
 # Programmatic pipeline (used by scheduler.py)
 # ---------------------------------------------------------------------------
 

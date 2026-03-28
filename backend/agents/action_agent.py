@@ -7,6 +7,7 @@ from safety.idempotency import generate_key, is_duplicate, record_key
 from safety.kill_switch import is_trading_halted
 from broker.broker_factory import get_broker
 from broker.order_manager import calculate_quantity, submit_order, poll_order_status
+from portfolio.position_manager import open_position
 
 logger = setup_logger(__name__)
 
@@ -155,10 +156,35 @@ def execute(decision: dict, symbol: str) -> dict:
             f"filled_qty={fill_result.get('filled_quantity')}"
         )
 
+        # ------------------------------------------------------------------
+        # Open position on confirmed fill
+        # ------------------------------------------------------------------
+        position_id = None
+        if executed and fill_result.get("filled_price") is not None:
+            fill_data = {
+                "trade_id":     trade_id,
+                "order_id":     order_result.get("order_id"),
+                "symbol":       symbol,
+                "action":       action,
+                "quantity":     fill_result.get("filled_quantity") or quantity,
+                "filled_price": fill_result.get("filled_price"),
+                "stop_loss":    decision.get("stop_loss"),
+                "target":       decision.get("target"),
+            }
+            position = open_position(fill_data)
+            if position:
+                position_id = position.get("position_id")
+            else:
+                logger.critical(
+                    f"[ACTION] open_position failed for trade {trade_id} — "
+                    f"order filled but no position record created"
+                )
+
         return {
             "executed":        executed,
             "trade_id":        trade_id,
             "order_id":        order_result.get("order_id"),
+            "position_id":     position_id,
             "broker_order_id": broker_order_id,
             "broker_mode":     broker_mode,
             "filled_price":    fill_result.get("filled_price"),
@@ -175,6 +201,7 @@ def execute(decision: dict, symbol: str) -> dict:
             "executed":        False,
             "trade_id":        None,
             "order_id":        None,
+            "position_id":     None,
             "broker_order_id": None,
             "broker_mode":     os.getenv("BROKER_MODE", "paper"),
             "filled_price":    None,
@@ -189,6 +216,7 @@ def _no_exec(reason: str) -> dict:
         "executed":        False,
         "trade_id":        None,
         "order_id":        None,
+        "position_id":     None,
         "broker_order_id": None,
         "broker_mode":     os.getenv("BROKER_MODE", "paper"),
         "filled_price":    None,
