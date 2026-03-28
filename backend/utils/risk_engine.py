@@ -20,6 +20,7 @@ trade should be rejected regardless.
 import pandas as pd
 import numpy as np
 from utils.logger import setup_logger
+from safety.capital_limits import check_limit, update_exposure
 
 logger = setup_logger(__name__)
 
@@ -27,7 +28,7 @@ MAX_KELLY_FRACTION = 0.50   # Never risk more than 50% of capital
 MAX_LOSS_HARD_CAP  = 0.10   # Absolute hard cap: reject if stop implies >10% loss
 
 
-def apply_risk(decision: dict, analysis: dict, ohlc: pd.DataFrame) -> dict:
+def apply_risk(decision: dict, analysis: dict, ohlc: pd.DataFrame, symbol: str = None) -> dict:
     """
     Apply risk management to a proposed trading decision.
 
@@ -35,6 +36,7 @@ def apply_risk(decision: dict, analysis: dict, ohlc: pd.DataFrame) -> dict:
         decision : dict from decision_agent (action, probability_up, …)
         analysis : dict from analysis_agent (support, resistance, volatility, …)
         ohlc     : pd.DataFrame with OHLCV columns
+        symbol   : str — required for capital limit check
 
     Returns:
         dict:
@@ -131,6 +133,23 @@ def apply_risk(decision: dict, analysis: dict, ohlc: pd.DataFrame) -> dict:
 
         # Cap at maximum fraction
         position_size_fraction = min(kelly, MAX_KELLY_FRACTION)
+
+        # ------------------------------------------------------------------
+        # 5. Capital limit check
+        # ------------------------------------------------------------------
+        if symbol:
+            ok, cap_reason = check_limit(symbol, position_size_fraction)
+            if not ok:
+                return _wait(
+                    cap_reason,
+                    entry=entry_price, sl=stop_loss, tgt=target, rr=rr_ratio, ml=max_loss_pct,
+                )
+            # Update exposure — log critical warning if DB write fails but do not block
+            if not update_exposure(symbol, position_size_fraction):
+                logger.critical(
+                    f"[RISK] Capital exposure update FAILED for {symbol} — "
+                    f"trade will proceed but exposure tracking is inconsistent"
+                )
 
         logger.info(
             f"[RISK] {action} validated: entry={entry_price:.2f}, SL={stop_loss:.2f}, "

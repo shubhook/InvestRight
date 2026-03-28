@@ -8,3 +8,4 @@ schedule
 feedparser
 psycopg2-binary
 redis
+PyJWT

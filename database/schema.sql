@@ -57,3 +57,35 @@ CREATE TABLE IF NOT EXISTS signals (
     reason              TEXT,
     created_at          TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Kill switch state
+CREATE TABLE IF NOT EXISTS kill_switch (
+    id              SERIAL PRIMARY KEY,
+    is_active       BOOLEAN NOT NULL DEFAULT FALSE,
+    reason          TEXT,
+    activated_by    VARCHAR(100),
+    activated_at    TIMESTAMPTZ DEFAULT NOW(),
+    deactivated_at  TIMESTAMPTZ
+);
+
+-- Insert default row (trading enabled) if table is empty
+INSERT INTO kill_switch (is_active, reason, activated_by)
+SELECT FALSE, 'system_init', 'system'
+WHERE NOT EXISTS (SELECT 1 FROM kill_switch);
+
+-- Idempotency log
+CREATE TABLE IF NOT EXISTS idempotency_log (
+    idempotency_key VARCHAR(100) PRIMARY KEY,
+    trade_id        UUID REFERENCES trades(trade_id),
+    symbol          VARCHAR(20) NOT NULL,
+    action          VARCHAR(10) NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Per-symbol capital limits
+CREATE TABLE IF NOT EXISTS capital_limits (
+    symbol               VARCHAR(20) PRIMARY KEY,
+    max_capital_pct      NUMERIC(5, 2) NOT NULL DEFAULT 10.00,
+    current_exposure_pct NUMERIC(5, 2) NOT NULL DEFAULT 0.00,
+    updated_at           TIMESTAMPTZ DEFAULT NOW()
+);
