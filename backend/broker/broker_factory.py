@@ -25,8 +25,16 @@ def get_broker() -> BaseBroker:
         return PaperBroker()
 
     # mode == "live"
-    api_key      = os.getenv("KITE_API_KEY")
+    api_key = os.getenv("KITE_API_KEY")
+
+    # Prefer DB-stored token (set via OAuth); fall back to env var
     access_token = os.getenv("KITE_ACCESS_TOKEN")
+    if not access_token:
+        try:
+            from auth.kite_token_refresh import get_active_token
+            access_token = get_active_token()
+        except Exception:
+            pass
 
     if not api_key or not access_token:
         logger.critical(

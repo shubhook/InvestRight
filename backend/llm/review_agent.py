@@ -1,7 +1,7 @@
 """
 LLM pre-execution safety review.
 Called on BUY/SELL decisions before action_agent stores the trade.
-Uses claude-sonnet for better reasoning.
+Uses llama-3.3-70b-versatile (Groq) for better reasoning.
 
 Fail-open: if LLM is unavailable, returns approved=True.
 """
@@ -109,7 +109,7 @@ def review_decision(
     raw = call_llm(
         prompt=user_prompt,
         system=_SYSTEM_PROMPT,
-        model="claude-sonnet-4-6",
+        model="llama-3.3-70b-versatile",
         max_tokens=300,
         trace_id=trace_id,
         agent_name="review_agent",

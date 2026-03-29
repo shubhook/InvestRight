@@ -93,30 +93,37 @@ class KiteBroker(BaseBroker):
         quantity = order_params.get("quantity", 0)
         symbol   = order_params.get("symbol", "")
         trade_id = order_params.get("trade_id")
+        price    = order_params.get("price")
 
         if quantity <= 0:
             return self._failed("Quantity must be greater than zero", order_params)
         if action not in ("BUY", "SELL"):
             return self._failed("Invalid action", order_params)
+        if not price:
+            return self._failed("Limit order requires a price (entry price missing)", order_params)
 
         exchange, tradingsymbol = _translate_symbol(symbol)
         product = os.getenv("KITE_PRODUCT", "MIS")
 
         try:
+            from utils.market_hours import is_market_open
             kite = _get_kite()
             transaction_type = (
                 kite.TRANSACTION_TYPE_BUY if action == "BUY"
                 else kite.TRANSACTION_TYPE_SELL
             )
+            variety = kite.VARIETY_REGULAR if is_market_open() else kite.VARIETY_AMO
             broker_order_id = kite.place_order(
-                variety=kite.VARIETY_REGULAR,
+                variety=variety,
                 exchange=exchange,
                 tradingsymbol=tradingsymbol,
                 transaction_type=transaction_type,
                 quantity=quantity,
                 product=product,
-                order_type=kite.ORDER_TYPE_MARKET,
+                order_type=kite.ORDER_TYPE_LIMIT,
+                price=round(float(price), 2),
             )
+            logger.info(f"[KITE] Using variety={'REGULAR' if variety == kite.VARIETY_REGULAR else 'AMO'}")
             order_id = str(uuid.uuid4())
             now = datetime.now(timezone.utc)
 

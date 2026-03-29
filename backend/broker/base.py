@@ -34,3 +34,12 @@ class BaseBroker(ABC):
     def get_ltp(self, symbol: str) -> Optional[float]:
         """Return last traded price for symbol, or None on failure."""
         ...
+
+    @abstractmethod
+    def get_portfolio(self) -> dict:
+        """
+        Return live holdings and positions from the broker.
+
+        Output keys: holdings (list), positions (list), error (str | None)
+        """
+        ...

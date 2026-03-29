@@ -1,7 +1,7 @@
 """
 LLM portfolio narrative summary agent.
 Generates human-readable portfolio summaries on demand.
-Uses claude-sonnet for quality output.
+Uses llama-3.3-70b-versatile (Groq) for quality output.
 Falls back to numeric string when LLM is unavailable.
 """
 import logging
@@ -104,7 +104,7 @@ def generate_portfolio_summary(
     raw = call_llm(
         prompt=user_prompt,
         system=_SYSTEM_PROMPT,
-        model="claude-sonnet-4-6",
+        model="llama-3.3-70b-versatile",
         max_tokens=300,
         trace_id=trace_id,
         agent_name="summary_agent",
@@ -153,7 +153,7 @@ def generate_daily_brief(
     raw = call_llm(
         prompt=user_prompt,
         system=_DAILY_SYSTEM_PROMPT,
-        model="claude-sonnet-4-6",
+        model="llama-3.3-70b-versatile",
         max_tokens=200,
         trace_id=trace_id,
         agent_name="summary_agent",

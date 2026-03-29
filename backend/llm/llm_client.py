@@ -1,10 +1,10 @@
 """
-Central wrapper for all Anthropic API calls.
-All LLM agents use this — never call the Anthropic API directly.
+Central wrapper for all Groq API calls.
+All LLM agents use this — never call the Groq API directly.
 
 Design rules:
   - Returns None on ANY failure (never raises).
-  - ANTHROPIC_API_KEY missing → log critical once, return None.
+  - GROQ_API_KEY missing → log critical once, return None.
   - 30-second timeout per call.
   - No retries — let the caller's fallback handle it.
   - Logs every call to llm_calls table via audit_log.
@@ -24,18 +24,18 @@ _MAX_PROMPT_CHARS = 12000   # rough guard (~3000 tokens at 4 chars/token)
 def call_llm(
     prompt: str,
     system: str,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "llama-3.1-8b-instant",
     max_tokens: int = 1000,
     trace_id: Optional[str] = None,
     agent_name: str = "unknown",
 ) -> Optional[str]:
     """
-    Call the Anthropic API and return the response text.
+    Call the Groq API and return the response text.
 
     Args:
         prompt:     User-role message content.
         system:     System-role prompt.
-        model:      Model ID (defaults to Haiku for speed/cost).
+        model:      Groq model ID (defaults to llama-3.1-8b-instant for speed/cost).
         max_tokens: Maximum tokens in the response.
         trace_id:   Pipeline trace UUID for audit logging.
         agent_name: Caller name for the llm_calls log.
@@ -45,20 +45,17 @@ def call_llm(
     """
     global _api_key_missing_logged
 
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         if not _api_key_missing_logged:
             _logger.critical(
-                "[LLM_CLIENT] ANTHROPIC_API_KEY not set — LLM features disabled. "
+                "[LLM_CLIENT] GROQ_API_KEY not set — LLM features disabled. "
                 "All agents will use fallbacks."
             )
             _api_key_missing_logged = True
         return None
 
     # Truncate over-long prompts (preserve first 80% + last 20%).
-    # Trading analysis prompts are front-loaded: prices, signals, and OHLCV data
-    # appear at the start, while boilerplate instructions appear at the end.
-    # Dropping from the back loses less critical context than dropping from the front.
     if len(prompt) > _MAX_PROMPT_CHARS:
         keep_start = int(_MAX_PROMPT_CHARS * 0.8)
         keep_end   = _MAX_PROMPT_CHARS - keep_start
@@ -75,27 +72,28 @@ def call_llm(
     response_text     = None
 
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key, timeout=30.0)
+        from groq import Groq
+        client = Groq(api_key=api_key, timeout=30.0)
 
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=model,
             max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": prompt},
+            ],
         )
 
-        if response.content and len(response.content) > 0:
-            raw = response.content[0]
-            response_text = getattr(raw, "text", None)
+        if response.choices and len(response.choices) > 0:
+            response_text = response.choices[0].message.content
 
         if response_text:
             status = "success"
 
         usage = getattr(response, "usage", None)
         if usage:
-            prompt_tokens     = getattr(usage, "input_tokens",  None)
-            completion_tokens = getattr(usage, "output_tokens", None)
+            prompt_tokens     = getattr(usage, "prompt_tokens",     None)
+            completion_tokens = getattr(usage, "completion_tokens", None)
 
     except Exception as e:
         _logger.warning(f"[LLM_CLIENT] API call failed ({agent_name}): {e}")

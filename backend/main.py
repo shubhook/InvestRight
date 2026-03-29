@@ -157,17 +157,16 @@ def health():
         status["model_health"] = {"is_healthy": True, "accuracy": None,
                                   "brier_score": None, "sample_size": 0}
 
-    # Kite token status (only in live mode)
-    if os.getenv("BROKER_MODE", "paper").lower() == "live":
-        try:
-            from auth.kite_token_refresh import is_token_valid, get_token_expiry
-            expiry = get_token_expiry()
-            status["kite_token"] = {
-                "valid":       is_token_valid(),
-                "valid_until": expiry.isoformat() if expiry else None,
-            }
-        except Exception:
-            status["kite_token"] = {"valid": False, "valid_until": None}
+    # Kite token status — always included so UI shows connection state in any broker mode
+    try:
+        from auth.kite_token_refresh import is_token_valid, get_token_expiry
+        expiry = get_token_expiry()
+        status["kite_token"] = {
+            "valid":       is_token_valid(),
+            "valid_until": expiry.isoformat() if expiry else None,
+        }
+    except Exception:
+        status["kite_token"] = {"valid": False, "valid_until": None}
 
     status["status"] = overall
     return jsonify(status)
@@ -492,6 +491,32 @@ def broker_status():
     return jsonify(status)
 
 
+@app.route("/broker/mode", methods=["POST"])
+@require_auth
+def set_broker_mode():
+    """
+    Switch broker mode at runtime — no restart required.
+    JSON body: { "mode": "live" | "paper" }
+    Switching to live is blocked if no valid Kite token exists.
+    """
+    body = request.get_json(silent=True) or {}
+    mode = (body.get("mode") or "").strip().lower()
+
+    if mode not in ("paper", "live"):
+        return jsonify({"error": "mode must be 'paper' or 'live'"}), 400
+
+    if mode == "live":
+        from auth.kite_token_refresh import is_token_valid
+        if not is_token_valid():
+            return jsonify({
+                "error": "No valid Kite token. Connect your Zerodha account first (Settings tab)."
+            }), 400
+
+    os.environ["BROKER_MODE"] = mode
+    logger.info(f"[API] Broker mode switched to: {mode}")
+    return jsonify({"broker_mode": mode})
+
+
 @app.route("/broker/kite/token", methods=["POST"])
 @require_auth
 def kite_store_token():
@@ -546,7 +571,7 @@ def kite_callback():
 
     Zerodha sends: ?request_token=XXX&status=success  (or status=error)
     """
-    _frontend = os.getenv("CORS_ORIGINS", "http://localhost:8080").split(",")[0].strip()
+    _frontend = os.getenv("FRONTEND_URL", "http://localhost:8080")
 
     status        = request.args.get("status", "")
     request_token = request.args.get("request_token", "").strip()
@@ -592,7 +617,9 @@ def _get_watchlist():
         )
         cols = ["symbol", "capital_pct", "is_active", "added_at", "updated_at"]
         return [
-            {k: (v.isoformat() if hasattr(v, "isoformat") else float(v) if k == "capital_pct" else v)
+            {k: (v.isoformat() if v is not None and hasattr(v, "isoformat")
+                 else float(v) if k == "capital_pct" and v is not None
+                 else v)
              for k, v in zip(cols, row)}
             for row in cur.fetchall()
         ]

@@ -1015,8 +1015,11 @@ function TradeSetupTab() {
 // Tab: Settings
 // ---------------------------------------------------------------------------
 function SettingsTab({ health }) {
-  const [connecting, setConnecting] = useState(false);
-  const [kiteMsg,    setKiteMsg]    = useState('');
+  const [connecting,   setConnecting]   = useState(false);
+  const [kiteMsg,      setKiteMsg]      = useState('');
+  const [brokerMode,   setBrokerMode]   = useState(null);
+  const [modeMsg,      setModeMsg]      = useState('');
+  const [togglingMode, setTogglingMode] = useState(false);
 
   // Read ?kite= param from URL after OAuth redirect back from Zerodha
   const urlParams  = new URLSearchParams(window.location.search);
@@ -1028,6 +1031,11 @@ function SettingsTab({ health }) {
       const clean = window.location.pathname;
       window.history.replaceState({}, '', clean);
     }
+    // Load current broker mode
+    apiFetch('/broker/status')
+      .then(r => r.json())
+      .then(d => setBrokerMode(d.broker_mode || 'paper'))
+      .catch(() => {});
   }, []);
 
   async function connectZerodha() {
@@ -1045,6 +1053,28 @@ function SettingsTab({ health }) {
     } catch {
       setKiteMsg('Network error — is the backend running?');
       setConnecting(false);
+    }
+  }
+
+  async function toggleMode() {
+    const target = brokerMode === 'live' ? 'paper' : 'live';
+    setTogglingMode(true);
+    setModeMsg('');
+    try {
+      const res  = await apiFetch('/broker/mode', {
+        method: 'POST',
+        body: JSON.stringify({ mode: target }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setBrokerMode(data.broker_mode);
+      } else {
+        setModeMsg(data.error || 'Failed to switch mode');
+      }
+    } catch {
+      setModeMsg('Network error');
+    } finally {
+      setTogglingMode(false);
     }
   }
 
@@ -1095,6 +1125,42 @@ function SettingsTab({ health }) {
             Prerequisites: Set <code className="bg-gray-800 px-1 rounded">KITE_API_SECRET</code> in your <code className="bg-gray-800 px-1 rounded">.env</code> file and set Redirect URL to <code className="bg-gray-800 px-1 rounded">http://localhost:5001/kite/callback</code> in your Zerodha developer console.
           </p>
         </div>
+      </Card>
+
+      <Card title="Broker Mode">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <span className={`text-sm font-bold px-3 py-1 rounded-full ${
+              brokerMode === 'live' ? 'bg-green-900 text-green-300' : 'bg-gray-800 text-gray-400'
+            }`}>
+              {brokerMode ? brokerMode.toUpperCase() : '…'}
+            </span>
+            <p className="text-xs text-gray-500 mt-2">
+              {brokerMode === 'live'
+                ? 'Real orders are being placed via Zerodha'
+                : 'Simulated trades — no real money at risk'}
+            </p>
+          </div>
+          <button
+            onClick={toggleMode}
+            disabled={togglingMode || !brokerMode}
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
+              brokerMode === 'live'
+                ? 'bg-gray-700 hover:bg-gray-600 text-white'
+                : 'bg-green-800 hover:bg-green-700 text-green-100'
+            }`}
+          >
+            {togglingMode ? 'Switching…' : `Switch to ${brokerMode === 'live' ? 'Paper' : 'Live'}`}
+          </button>
+        </div>
+        {modeMsg && (
+          <p className="text-red-400 text-xs mt-1">{modeMsg}</p>
+        )}
+        {brokerMode === 'live' && (
+          <p className="text-yellow-500 text-xs mt-2">
+            Live mode is active. All trades will place real orders on your Zerodha account.
+          </p>
+        )}
       </Card>
 
       <Card title="System Info">

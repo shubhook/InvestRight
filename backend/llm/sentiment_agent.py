@@ -89,7 +89,7 @@ def classify_sentiment_with_score(
     raw = call_llm(
         prompt=user_prompt,
         system=_SYSTEM_PROMPT,
-        model="claude-haiku-4-5-20251001",
+        model="llama-3.1-8b-instant",
         max_tokens=256,
         trace_id=trace_id,
         agent_name="sentiment_agent",

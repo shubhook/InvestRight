@@ -34,12 +34,17 @@ class PaperBroker(BaseBroker):
 
         order_id = str(uuid.uuid4())
 
-        # Try to get LTP; fall back to decision price
+        # Limit order simulation: fill at the limit price (entry price from risk engine).
+        # Fall back to LTP if price is missing, then to decision entry.
+        limit_price = order_params.get("price") or order_params.get("entry")
         ltp = self.get_ltp(symbol)
-        if ltp is None:
-            ltp = order_params.get("price") or order_params.get("entry")
+        fill_price = limit_price or ltp
+        if fill_price is None:
+            return self._failed("No price available for limit order fill", order_params)
+        ltp = fill_price
+        if not limit_price:
             logger.warning(
-                f"[PAPER] LTP unavailable for {symbol} — filling at decision price {ltp}"
+                f"[PAPER] No limit price for {symbol} — filling at LTP {ltp}"
             )
 
         now = datetime.now(timezone.utc)
@@ -144,6 +149,15 @@ class PaperBroker(BaseBroker):
         except Exception as e:
             logger.warning(f"[PAPER] LTP fetch failed for {symbol}: {e}")
             return None
+
+    def get_portfolio(self) -> dict:
+        """Paper trading has no real account — return empty portfolio."""
+        return {
+            "holdings":  [],
+            "positions": [],
+            "error":     None,
+            "note":      "Paper trading mode — no real holdings.",
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers
