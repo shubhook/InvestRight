@@ -239,6 +239,54 @@ class KiteBroker(BaseBroker):
             logger.error(f"[KITE] cancel_order failed: {e}")
             return False
 
+    def get_portfolio(self) -> dict:
+        """
+        Fetch live holdings and intraday positions from Zerodha.
+
+        Returns:
+            {
+                "holdings": [...],   # Delivery holdings (CNC)
+                "positions": [...],  # Intraday positions (MIS/day)
+                "error": None | str
+            }
+        """
+        try:
+            kite = _get_kite()
+            holdings  = kite.holdings()  or []
+            positions = (kite.positions() or {}).get("day", [])
+
+            def _fmt_holding(h):
+                return {
+                    "symbol":          h.get("tradingsymbol", ""),
+                    "exchange":        h.get("exchange", "NSE"),
+                    "quantity":        h.get("quantity", 0),
+                    "avg_price":       float(h.get("average_price") or 0),
+                    "last_price":      float(h.get("last_price") or 0),
+                    "pnl":             float(h.get("pnl") or 0),
+                    "day_change_pct":  float(h.get("day_change_percentage") or 0),
+                }
+
+            def _fmt_position(p):
+                return {
+                    "symbol":      p.get("tradingsymbol", ""),
+                    "exchange":    p.get("exchange", "NSE"),
+                    "quantity":    p.get("quantity", 0),
+                    "avg_price":   float(p.get("average_price") or 0),
+                    "last_price":  float(p.get("last_price") or 0),
+                    "pnl":         float(p.get("pnl") or 0),
+                    "product":     p.get("product", ""),
+                }
+
+            return {
+                "holdings":  [_fmt_holding(h) for h in holdings],
+                "positions": [_fmt_position(p) for p in positions],
+                "error":     None,
+            }
+
+        except Exception as e:
+            logger.warning(f"[KITE] get_portfolio failed: {e}")
+            return {"holdings": [], "positions": [], "error": str(e)}
+
     def get_ltp(self, symbol: str) -> Optional[float]:
         exchange, tradingsymbol = _translate_symbol(symbol)
         instrument = f"{exchange}:{tradingsymbol}"

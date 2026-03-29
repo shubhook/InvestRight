@@ -83,7 +83,7 @@ function LoginScreen({ onLogin }) {
 // ---------------------------------------------------------------------------
 // NavBar
 // ---------------------------------------------------------------------------
-const TABS = ['Overview', 'Portfolio', 'Trades', 'Backtest', 'Observability', 'Settings'];
+const TABS = ['Overview', 'Trade Setup', 'Portfolio', 'Trades', 'Backtest', 'Observability', 'Settings'];
 
 function NavBar({ activeTab, setActiveTab, killActive, onLogout }) {
   return (
@@ -693,35 +693,358 @@ function ObservabilityTab() {
 }
 
 // ---------------------------------------------------------------------------
-// Tab: Settings
+// Tab: Trade Setup
 // ---------------------------------------------------------------------------
-function SettingsTab({ health }) {
-  const [kiteToken, setKiteToken] = useState('');
-  const [kiteReq, setKiteReq]     = useState('');
-  const [kiteMsg, setKiteMsg]     = useState('');
-  const [saving, setSaving]       = useState(false);
+function TradeSetupTab() {
+  const [watchlist,    setWatchlist]    = useState([]);
+  const [liveHoldings, setLiveHoldings] = useState(null);
+  const [liveErr,      setLiveErr]      = useState('');
+  const [loadingLive,  setLoadingLive]  = useState(false);
 
-  async function saveKiteToken(e) {
+  // form state
+  const [symbol,     setSymbol]     = useState('');
+  const [capitalPct, setCapitalPct] = useState(10);
+  const [formMsg,    setFormMsg]    = useState('');
+  const [saving,     setSaving]     = useState(false);
+
+  // total capital from portfolio (for ₹ display)
+  const [totalCapital, setTotalCapital] = useState(0);
+
+  async function loadWatchlist() {
+    try {
+      const res  = await apiFetch('/watchlist');
+      const data = await res.json();
+      if (res.ok) setWatchlist(data.watchlist || []);
+    } catch { /* ignore */ }
+  }
+
+  async function loadPortfolioCapital() {
+    try {
+      const res  = await apiFetch('/portfolio');
+      const data = await res.json();
+      setTotalCapital(data?.capital?.total_capital || 0);
+    } catch { /* ignore */ }
+  }
+
+  useEffect(() => {
+    loadWatchlist();
+    loadPortfolioCapital();
+  }, []);
+
+  async function fetchLiveHoldings() {
+    setLoadingLive(true);
+    setLiveErr('');
+    try {
+      const res  = await apiFetch('/portfolio/live');
+      const data = await res.json();
+      if (res.ok) {
+        setLiveHoldings(data);
+      } else {
+        setLiveErr(data.error || 'Failed to fetch');
+      }
+    } catch {
+      setLiveErr('Network error');
+    } finally {
+      setLoadingLive(false);
+    }
+  }
+
+  function pickFromHolding(sym) {
+    // Zerodha returns plain ticker (e.g. "RELIANCE") — append .NS
+    const formatted = sym.includes('.') ? sym : `${sym}.NS`;
+    setSymbol(formatted);
+    setFormMsg('');
+  }
+
+  async function handleAdd(e) {
     e.preventDefault();
     setSaving(true);
-    setKiteMsg('');
+    setFormMsg('');
     try {
-      const res  = await apiFetch('/broker/kite/token', {
+      const res  = await apiFetch('/watchlist', {
         method: 'POST',
-        body: JSON.stringify({ access_token: kiteToken, request_token: kiteReq }),
+        body: JSON.stringify({ symbol: symbol.trim().toUpperCase(), capital_pct: capitalPct }),
       });
       const data = await res.json();
       if (res.ok) {
-        setKiteMsg(`Token stored. Valid until: ${data.valid_until ? new Date(data.valid_until).toLocaleString() : '—'}`);
-        setKiteToken('');
-        setKiteReq('');
+        setFormMsg(`${data.symbol} added (${data.capital_pct}% capital)`);
+        setSymbol('');
+        setCapitalPct(10);
+        await loadWatchlist();
       } else {
-        setKiteMsg(`Error: ${data.error}`);
+        setFormMsg(`Error: ${data.error}`);
       }
     } catch {
-      setKiteMsg('Network error');
+      setFormMsg('Network error');
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleRemove(sym) {
+    try {
+      const res = await apiFetch(`/watchlist/${encodeURIComponent(sym)}`, { method: 'DELETE' });
+      if (res.ok) await loadWatchlist();
+    } catch { /* ignore */ }
+  }
+
+  const rupeeAmt = totalCapital > 0
+    ? `≈ ₹${Math.round(totalCapital * capitalPct / 100).toLocaleString('en-IN')}`
+    : '';
+
+  const allocatedPct = watchlist.filter(w => w.is_active).reduce((s, w) => s + w.capital_pct, 0);
+
+  return (
+    <div className="p-4 space-y-4 max-w-3xl">
+
+      {/* Live Zerodha Holdings */}
+      <Card title="Your Zerodha Portfolio">
+        <p className="text-xs text-gray-500 mb-3">
+          Fetch your live holdings from Zerodha to quickly pick stocks for today's trading.
+        </p>
+        <button
+          onClick={fetchLiveHoldings}
+          disabled={loadingLive}
+          className="bg-brand hover:bg-brand-dark disabled:opacity-50 text-white px-4 py-2 rounded text-sm font-medium transition-colors flex items-center gap-2"
+        >
+          {loadingLive ? <><Spinner /> Fetching…</> : 'Fetch Live Holdings'}
+        </button>
+        {liveErr && <p className="text-red-400 text-xs mt-2">{liveErr}</p>}
+
+        {liveHoldings && (
+          <div className="mt-4 space-y-3">
+            {liveHoldings.note && (
+              <p className="text-yellow-400 text-xs">{liveHoldings.note}</p>
+            )}
+            {liveHoldings.holdings && liveHoldings.holdings.length > 0 && (
+              <div>
+                <p className="text-xs text-gray-500 mb-2 uppercase tracking-wider">Holdings (Delivery)</p>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-gray-500 border-b border-gray-800">
+                        <th className="text-left py-1 pr-3">Symbol</th>
+                        <th className="text-right pr-3">Qty</th>
+                        <th className="text-right pr-3">Avg Price</th>
+                        <th className="text-right pr-3">LTP</th>
+                        <th className="text-right pr-3">P&L</th>
+                        <th className="text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {liveHoldings.holdings.map(h => (
+                        <tr key={h.symbol} className="border-b border-gray-800/40 hover:bg-gray-800/30">
+                          <td className="py-1 pr-3 font-medium text-white">{h.symbol}</td>
+                          <td className="text-right pr-3 text-gray-300">{h.quantity}</td>
+                          <td className="text-right pr-3 text-gray-300">₹{h.avg_price?.toFixed(2)}</td>
+                          <td className="text-right pr-3 text-gray-300">₹{h.last_price?.toFixed(2)}</td>
+                          <td className={`text-right pr-3 font-medium ${h.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {h.pnl >= 0 ? '+' : ''}₹{h.pnl?.toFixed(0)}
+                          </td>
+                          <td className="text-right">
+                            <button
+                              onClick={() => pickFromHolding(h.symbol)}
+                              className="text-brand hover:text-indigo-300 text-xs underline"
+                            >
+                              Select
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+            {liveHoldings.positions && liveHoldings.positions.length > 0 && (
+              <div>
+                <p className="text-xs text-gray-500 mb-2 uppercase tracking-wider">Intraday Positions</p>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-gray-500 border-b border-gray-800">
+                        <th className="text-left py-1 pr-3">Symbol</th>
+                        <th className="text-right pr-3">Qty</th>
+                        <th className="text-right pr-3">Avg Price</th>
+                        <th className="text-right pr-3">LTP</th>
+                        <th className="text-right pr-3">P&L</th>
+                        <th className="text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {liveHoldings.positions.map(p => (
+                        <tr key={p.symbol} className="border-b border-gray-800/40 hover:bg-gray-800/30">
+                          <td className="py-1 pr-3 font-medium text-white">{p.symbol}</td>
+                          <td className="text-right pr-3 text-gray-300">{p.quantity}</td>
+                          <td className="text-right pr-3 text-gray-300">₹{p.avg_price?.toFixed(2)}</td>
+                          <td className="text-right pr-3 text-gray-300">₹{p.last_price?.toFixed(2)}</td>
+                          <td className={`text-right pr-3 font-medium ${p.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {p.pnl >= 0 ? '+' : ''}₹{p.pnl?.toFixed(0)}
+                          </td>
+                          <td className="text-right">
+                            <button
+                              onClick={() => pickFromHolding(p.symbol)}
+                              className="text-brand hover:text-indigo-300 text-xs underline"
+                            >
+                              Select
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+            {liveHoldings.holdings?.length === 0 && liveHoldings.positions?.length === 0 && !liveHoldings.note && (
+              <p className="text-gray-500 text-xs">No holdings or positions found in your Zerodha account.</p>
+            )}
+          </div>
+        )}
+      </Card>
+
+      {/* Add Stock Form */}
+      <Card title="Add Stock to Today's Trading">
+        <form onSubmit={handleAdd} className="space-y-4">
+          <div>
+            <label className="block text-xs text-gray-500 mb-1">Symbol</label>
+            <input
+              type="text"
+              value={symbol}
+              onChange={e => setSymbol(e.target.value.toUpperCase())}
+              placeholder="e.g. RELIANCE.NS"
+              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-brand"
+            />
+            <p className="text-xs text-gray-600 mt-1">Use .NS for NSE, .BO for BSE. Or click Select above.</p>
+          </div>
+
+          <div>
+            <div className="flex justify-between items-center mb-1">
+              <label className="text-xs text-gray-500">Capital Allocation</label>
+              <span className="text-sm font-bold text-white">
+                {capitalPct}% {rupeeAmt && <span className="text-gray-400 font-normal text-xs">{rupeeAmt}</span>}
+              </span>
+            </div>
+            <input
+              type="range"
+              min="1"
+              max="100"
+              value={capitalPct}
+              onChange={e => setCapitalPct(Number(e.target.value))}
+              className="w-full accent-indigo-500"
+            />
+            <div className="flex justify-between text-xs text-gray-600 mt-0.5">
+              <span>1%</span>
+              <span>50%</span>
+              <span>100%</span>
+            </div>
+          </div>
+
+          {formMsg && (
+            <p className={`text-xs ${formMsg.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>
+              {formMsg}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            disabled={saving || !symbol.trim()}
+            className="bg-brand hover:bg-brand-dark disabled:opacity-50 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
+          >
+            {saving ? 'Adding…' : 'Add to Watchlist'}
+          </button>
+        </form>
+      </Card>
+
+      {/* Current Watchlist */}
+      <Card title={`Active Watchlist (${watchlist.filter(w => w.is_active).length} stocks)`}>
+        {allocatedPct > 0 && (
+          <div className="mb-3 flex items-center gap-2">
+            <div className="flex-1 bg-gray-800 rounded-full h-2">
+              <div
+                className={`h-2 rounded-full transition-all ${allocatedPct > 100 ? 'bg-red-500' : 'bg-brand'}`}
+                style={{ width: `${Math.min(allocatedPct, 100)}%` }}
+              />
+            </div>
+            <span className={`text-xs font-medium ${allocatedPct > 100 ? 'text-red-400' : 'text-gray-400'}`}>
+              {allocatedPct.toFixed(1)}% allocated
+              {allocatedPct > 100 && ' — exceeds 100%!'}
+            </span>
+          </div>
+        )}
+
+        {watchlist.length === 0 ? (
+          <p className="text-gray-500 text-sm">
+            No stocks in watchlist. Add stocks above — the scheduler will start trading them on the next 15-min cycle.
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {watchlist.map(w => (
+              <div key={w.symbol} className="flex items-center justify-between py-2 border-b border-gray-800/50">
+                <div className="flex items-center gap-3">
+                  <span className={`w-2 h-2 rounded-full ${w.is_active ? 'bg-green-400' : 'bg-gray-600'}`} />
+                  <span className="font-medium text-white text-sm">{w.symbol}</span>
+                </div>
+                <div className="flex items-center gap-4">
+                  <div className="text-right">
+                    <span className="text-sm font-bold text-indigo-400">{w.capital_pct}%</span>
+                    {totalCapital > 0 && (
+                      <span className="text-xs text-gray-500 ml-1">
+                        ₹{Math.round(totalCapital * w.capital_pct / 100).toLocaleString('en-IN')}
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => handleRemove(w.symbol)}
+                    className="text-red-500 hover:text-red-400 text-xs transition-colors"
+                    title="Remove from watchlist"
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tab: Settings
+// ---------------------------------------------------------------------------
+function SettingsTab({ health }) {
+  const [connecting, setConnecting] = useState(false);
+  const [kiteMsg,    setKiteMsg]    = useState('');
+
+  // Read ?kite= param from URL after OAuth redirect back from Zerodha
+  const urlParams  = new URLSearchParams(window.location.search);
+  const kiteStatus = urlParams.get('kite');
+
+  // Clean the URL param after reading it (only once on mount)
+  useEffect(() => {
+    if (kiteStatus) {
+      const clean = window.location.pathname;
+      window.history.replaceState({}, '', clean);
+    }
+  }, []);
+
+  async function connectZerodha() {
+    setConnecting(true);
+    setKiteMsg('');
+    try {
+      const res  = await fetch(`${API_BASE}/kite/login`);
+      const data = await res.json();
+      if (res.ok && data.login_url) {
+        window.location.href = data.login_url;
+      } else {
+        setKiteMsg(`Error: ${data.error || 'Could not get login URL'}`);
+        setConnecting(false);
+      }
+    } catch {
+      setKiteMsg('Network error — is the backend running?');
+      setConnecting(false);
     }
   }
 
@@ -729,46 +1052,49 @@ function SettingsTab({ health }) {
 
   return (
     <div className="p-4 space-y-4 max-w-lg">
-      <Card title="Kite Access Token">
-        {kt && (
-          <div className={`text-sm mb-3 ${kt.valid ? 'text-green-400' : 'text-red-400'}`}>
-            {kt.valid
-              ? `Token valid until ${kt.valid_until ? new Date(kt.valid_until).toLocaleString() : '—'}`
-              : 'No valid token — trading will fail in live mode'}
+      <Card title="Zerodha Account Connection">
+        {/* OAuth return status banner */}
+        {kiteStatus === 'connected' && (
+          <div className="bg-green-900/40 border border-green-700 rounded-lg px-4 py-3 mb-4 text-green-300 text-sm">
+            Zerodha connected successfully! Token is active until 6:00 AM IST.
           </div>
         )}
-        <form onSubmit={saveKiteToken} className="space-y-3">
-          <div>
-            <label className="block text-xs text-gray-500 mb-1">Access Token</label>
-            <input
-              type="password"
-              value={kiteToken}
-              onChange={e => setKiteToken(e.target.value)}
-              placeholder="Paste Kite access token"
-              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-brand"
-            />
+        {kiteStatus === 'failed' && (
+          <div className="bg-red-900/40 border border-red-700 rounded-lg px-4 py-3 mb-4 text-red-300 text-sm">
+            Zerodha connection failed. Make sure your Redirect URL in Zerodha developer console is set to <code className="bg-gray-800 px-1 rounded">http://localhost:5001/kite/callback</code>
           </div>
-          <div>
-            <label className="block text-xs text-gray-500 mb-1">Request Token (optional)</label>
-            <input
-              type="text"
-              value={kiteReq}
-              onChange={e => setKiteReq(e.target.value)}
-              placeholder="Request token for audit"
-              className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-brand"
-            />
-          </div>
-          {kiteMsg && (
-            <p className={`text-xs ${kiteMsg.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>{kiteMsg}</p>
-          )}
-          <button
-            type="submit"
-            disabled={saving || !kiteToken}
-            className="bg-brand hover:bg-brand-dark disabled:opacity-50 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
-          >
-            {saving ? 'Saving…' : 'Store Token'}
-          </button>
-        </form>
+        )}
+
+        {/* Current token status */}
+        <div className={`flex items-center gap-2 mb-4 text-sm ${kt?.valid ? 'text-green-400' : 'text-red-400'}`}>
+          <span className={`w-2 h-2 rounded-full ${kt?.valid ? 'bg-green-400' : 'bg-red-400'}`} />
+          {kt?.valid
+            ? `Connected — token valid until ${kt.valid_until ? new Date(kt.valid_until).toLocaleString() : '6:00 AM IST'}`
+            : 'Not connected — click below to link your Zerodha account'}
+        </div>
+
+        <button
+          onClick={connectZerodha}
+          disabled={connecting}
+          className="w-full bg-brand hover:bg-brand-dark disabled:opacity-50 text-white py-2.5 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
+        >
+          {connecting ? <><Spinner /> Redirecting to Zerodha…</> : 'Connect Zerodha Account'}
+        </button>
+
+        {kiteMsg && <p className="text-red-400 text-xs mt-2">{kiteMsg}</p>}
+
+        <div className="mt-4 pt-4 border-t border-gray-800 space-y-1 text-xs text-gray-500">
+          <p>How it works:</p>
+          <ol className="list-decimal list-inside space-y-1 text-gray-600">
+            <li>Click the button above → you'll be taken to Zerodha's login page</li>
+            <li>Log in with your Zerodha credentials</li>
+            <li>You'll be redirected back here automatically</li>
+            <li>Repeat every morning — Zerodha tokens expire at 6:00 AM IST daily</li>
+          </ol>
+          <p className="pt-2 text-gray-600">
+            Prerequisites: Set <code className="bg-gray-800 px-1 rounded">KITE_API_SECRET</code> in your <code className="bg-gray-800 px-1 rounded">.env</code> file and set Redirect URL to <code className="bg-gray-800 px-1 rounded">http://localhost:5001/kite/callback</code> in your Zerodha developer console.
+          </p>
+        </div>
       </Card>
 
       <Card title="System Info">
@@ -833,6 +1159,7 @@ function App() {
       />
       <main className="flex-1 overflow-auto">
         {activeTab === 'Overview'       && <OverviewTab health={health} portfolio={portfolio} killActive={killActive} setKillActive={setKillActive} showModal={showModal} setShowModal={setShowModal} />}
+        {activeTab === 'Trade Setup'    && <TradeSetupTab />}
         {activeTab === 'Portfolio'      && <PortfolioTab />}
         {activeTab === 'Trades'         && <TradesTab />}
         {activeTab === 'Backtest'       && <BacktestTab />}

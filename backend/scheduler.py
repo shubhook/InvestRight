@@ -130,11 +130,39 @@ def db_cleanup_job():
         logger.error(f"[SCHEDULER] db_cleanup_job error: {e}")
 
 
+def get_watchlist_symbols():
+    """
+    Return active symbols from the DB watchlist.
+    Falls back to Config.SYMBOLS if the watchlist table is empty or unavailable.
+    """
+    try:
+        from db.connection import db_cursor
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT symbol FROM watchlist WHERE is_active = TRUE ORDER BY added_at ASC"
+            )
+            rows = cur.fetchall()
+        if rows:
+            return [r[0] for r in rows]
+    except Exception as e:
+        logger.warning(f"[SCHEDULER] Could not read watchlist from DB: {e}")
+    fallback = getattr(Config, 'SYMBOLS', ['RELIANCE.NS'])
+    logger.info(f"[SCHEDULER] Watchlist empty — falling back to Config.SYMBOLS: {fallback}")
+    return fallback
+
+
+def watchlist_analysis_job():
+    """Run analysis for every active symbol in the watchlist."""
+    symbols = get_watchlist_symbols()
+    logger.info(f"[SCHEDULER] Running analysis for watchlist: {symbols}")
+    for symbol in symbols:
+        analysis_job(symbol)
+
+
 def run_scheduler():
     """Set up and run the scheduler."""
     from config import validate_required_env
     validate_required_env()
-    symbols = getattr(Config, 'SYMBOLS', ['RELIANCE.NS'])
 
     # Degradation check — runs every 15 min, BEFORE analysis
     schedule.every(15).minutes.do(degradation_check_job)
@@ -142,10 +170,10 @@ def run_scheduler():
     # Exit monitor — runs every 15 min, BEFORE analysis
     schedule.every(15).minutes.do(exit_job)
 
-    # Analysis pipeline — per symbol, every 15 min
-    for symbol in symbols:
-        schedule.every(15).minutes.do(analysis_job, symbol)
-        logger.info(f"[SCHEDULER] Scheduled analysis for {symbol} every 15 minutes")
+    # Analysis pipeline — reads watchlist from DB each time, so adding/removing
+    # symbols via the dashboard takes effect on the next cycle without a restart
+    schedule.every(15).minutes.do(watchlist_analysis_job)
+    logger.info("[SCHEDULER] Scheduled watchlist analysis every 15 minutes (dynamic)")
 
     # Pending trade evaluation — every 15 min during market hours
     schedule.every(15).minutes.do(pending_trade_evaluation_job)
@@ -168,8 +196,7 @@ def run_scheduler():
     degradation_check_job()
     exit_job()
     pending_trade_evaluation_job()
-    for symbol in symbols:
-        analysis_job(symbol)
+    watchlist_analysis_job()
 
     logger.info("[SCHEDULER] Scheduler running. Press Ctrl+C to exit.")
     while True:

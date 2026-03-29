@@ -5,7 +5,7 @@ import traceback
 import threading
 from dotenv import load_dotenv
 load_dotenv()  # Must run before any module that reads env vars at import time
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from observability.trace import TraceContext, generate_trace_id
 from observability.audit_log import (
@@ -522,6 +522,167 @@ def kite_store_token():
 
 
 # ---------------------------------------------------------------------------
+# Kite OAuth endpoints (public — no auth required)
+# ---------------------------------------------------------------------------
+
+@app.route("/kite/login", methods=["GET"])
+def kite_login_url():
+    """
+    Return the Zerodha login URL.
+    The frontend redirects the user here to kick off OAuth.
+    """
+    api_key = os.getenv("KITE_API_KEY")
+    if not api_key:
+        return jsonify({"error": "KITE_API_KEY not configured"}), 500
+    url = f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"
+    return jsonify({"login_url": url})
+
+
+@app.route("/kite/callback", methods=["GET"])
+def kite_callback():
+    """
+    Zerodha redirects here after the user logs in.
+    Exchanges the one-time request_token for a persistent access_token.
+
+    Zerodha sends: ?request_token=XXX&status=success  (or status=error)
+    """
+    _frontend = os.getenv("CORS_ORIGINS", "http://localhost:8080").split(",")[0].strip()
+
+    status        = request.args.get("status", "")
+    request_token = request.args.get("request_token", "").strip()
+
+    if status != "success" or not request_token:
+        logger.warning(f"[KITE_CALLBACK] Bad callback — status={status}")
+        return redirect(f"{_frontend}/?kite=failed")
+
+    try:
+        from kiteconnect import KiteConnect
+        api_key    = os.getenv("KITE_API_KEY")
+        api_secret = os.getenv("KITE_API_SECRET")
+
+        if not api_key or not api_secret:
+            logger.error("[KITE_CALLBACK] KITE_API_KEY or KITE_API_SECRET not set")
+            return redirect(f"{_frontend}/?kite=failed")
+
+        kite = KiteConnect(api_key=api_key)
+        session_data = kite.generate_session(request_token, api_secret=api_secret)
+        access_token = session_data["access_token"]
+
+        from auth.kite_token_refresh import store_token
+        store_token(access_token, request_token)
+
+        logger.info("[KITE_CALLBACK] Access token stored — Kite connected successfully")
+        return redirect(f"{_frontend}/?kite=connected")
+
+    except Exception as e:
+        logger.error(f"[KITE_CALLBACK] generate_session failed: {e}")
+        return redirect(f"{_frontend}/?kite=failed")
+
+
+# ---------------------------------------------------------------------------
+# Watchlist endpoints
+# ---------------------------------------------------------------------------
+
+def _get_watchlist():
+    from db.connection import db_cursor
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT symbol, capital_pct, is_active, added_at, updated_at "
+            "FROM watchlist ORDER BY added_at ASC"
+        )
+        cols = ["symbol", "capital_pct", "is_active", "added_at", "updated_at"]
+        return [
+            {k: (v.isoformat() if hasattr(v, "isoformat") else float(v) if k == "capital_pct" else v)
+             for k, v in zip(cols, row)}
+            for row in cur.fetchall()
+        ]
+
+
+@app.route("/watchlist", methods=["GET"])
+@require_auth
+def watchlist_get():
+    """Return all watchlist entries."""
+    try:
+        return jsonify({"watchlist": _get_watchlist()})
+    except Exception as e:
+        logger.error(f"[API] /watchlist GET error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/watchlist", methods=["POST"])
+@require_auth
+def watchlist_add():
+    """
+    Add or update a symbol in the watchlist.
+
+    JSON body:
+        symbol      (str, required)  e.g. "RELIANCE.NS"
+        capital_pct (float, optional) percentage of total capital, default 10
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        symbol = (body.get("symbol") or "").strip().upper()
+        if not symbol:
+            return jsonify({"error": "symbol is required"}), 400
+        if not re.match(r"^[A-Z0-9.\-]{1,20}$", symbol):
+            return jsonify({"error": "Invalid symbol format"}), 400
+
+        capital_pct = float(body.get("capital_pct", 10.0))
+        if not (0 < capital_pct <= 100):
+            return jsonify({"error": "capital_pct must be between 0 and 100"}), 400
+
+        from db.connection import db_cursor
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO watchlist (symbol, capital_pct, is_active, updated_at)
+                VALUES (%s, %s, TRUE, NOW())
+                ON CONFLICT (symbol) DO UPDATE
+                    SET capital_pct = EXCLUDED.capital_pct,
+                        is_active   = TRUE,
+                        updated_at  = NOW()
+                """,
+                (symbol, capital_pct),
+            )
+            # Sync capital limits table so risk engine picks up the allocation
+            cur.execute(
+                """
+                INSERT INTO capital_limits (symbol, max_capital_pct, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (symbol) DO UPDATE
+                    SET max_capital_pct = EXCLUDED.max_capital_pct,
+                        updated_at      = NOW()
+                """,
+                (symbol, capital_pct),
+            )
+
+        logger.info(f"[API] Watchlist: added/updated {symbol} @ {capital_pct}%")
+        return jsonify({"symbol": symbol, "capital_pct": capital_pct, "is_active": True}), 201
+
+    except Exception as e:
+        logger.error(f"[API] /watchlist POST error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/watchlist/<symbol>", methods=["DELETE"])
+@require_auth
+def watchlist_remove(symbol):
+    """Remove a symbol from the watchlist."""
+    try:
+        symbol = symbol.strip().upper()
+        from db.connection import db_cursor
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM watchlist WHERE symbol = %s", (symbol,))
+            if cur.rowcount == 0:
+                return jsonify({"error": "Symbol not in watchlist"}), 404
+        logger.info(f"[API] Watchlist: removed {symbol}")
+        return jsonify({"removed": symbol})
+    except Exception as e:
+        logger.error(f"[API] /watchlist DELETE error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
 # Portfolio endpoints
 # ---------------------------------------------------------------------------
 
@@ -606,6 +767,30 @@ def close_position_manual(position_id):
     except Exception as e:
         logger.error(f"[API] /portfolio/positions/{position_id}/close error: {e}")
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
+
+@app.route("/portfolio/live", methods=["GET"])
+@require_auth
+def portfolio_live():
+    """
+    Fetch live holdings and intraday positions directly from Zerodha.
+    Only works in live broker mode with a valid Kite token.
+    """
+    try:
+        from broker.broker_factory import get_broker
+        from broker.kite_broker import KiteBroker
+        broker = get_broker()
+        if not isinstance(broker, KiteBroker):
+            return jsonify({
+                "holdings":  [],
+                "positions": [],
+                "note":      "Live portfolio fetch only available in live broker mode.",
+            })
+        result = broker.get_portfolio()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"[API] /portfolio/live error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/portfolio/pnl", methods=["GET"])

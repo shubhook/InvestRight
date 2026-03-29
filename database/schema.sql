@@ -300,6 +300,16 @@ CREATE TABLE IF NOT EXISTS kite_tokens (
     created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Watchlist — user-selected symbols for autonomous trading
+CREATE TABLE IF NOT EXISTS watchlist (
+    symbol          VARCHAR(20) PRIMARY KEY,
+    capital_pct     NUMERIC(5, 2) NOT NULL DEFAULT 10.00
+                    CHECK (capital_pct > 0 AND capital_pct <= 100),
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    added_at        TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS llm_calls (
     call_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     trace_id          UUID,
