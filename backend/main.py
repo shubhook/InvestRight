@@ -283,6 +283,61 @@ def analyze():
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 
+@app.route("/sentiment", methods=["GET"])
+@require_auth
+def sentiment():
+    """
+    Read-only analysis scan of all active watchlist symbols.
+    Runs data → analysis → pattern → decision pipeline only.
+    Does NOT execute trades, does NOT check the kill switch.
+    Returns bullish/bearish signals for each symbol.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import datetime
+
+    try:
+        watchlist = _get_watchlist()
+        active_symbols = [w["symbol"] for w in watchlist if w.get("is_active", True)]
+
+        if not active_symbols:
+            return jsonify({"results": [], "generated_at": datetime.utcnow().isoformat()})
+
+        def _analyze_symbol(symbol):
+            try:
+                trace = TraceContext(generate_trace_id(), symbol)
+                data = fetch_and_package_data(symbol, trace=trace)
+                if data is None:
+                    return {"symbol": symbol, "error": "Failed to fetch data"}
+                analysis = analyze_data(data, trace=trace)
+                pattern  = detect_pattern(data["ohlc"], trace=trace)
+                current_price = (
+                    float(data["ohlc"]["close"].iloc[-1])
+                    if data.get("ohlc") is not None and not data["ohlc"].empty
+                    else None
+                )
+                decision = make_decision(analysis, pattern, current_price=current_price, trace=trace)
+                # Sentinel risk dict — no apply_risk or broker calls
+                return _build_response(symbol, decision, {"action": decision.get("action", "WAIT")}, analysis, pattern)
+            except Exception as e:
+                logger.warning(f"[API] /sentiment failed for {symbol}: {e}")
+                return {"symbol": symbol, "error": str(e)}
+
+        results = []
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(_analyze_symbol, sym): sym for sym in active_symbols}
+            for future in as_completed(futures):
+                results.append(future.result())
+
+        return jsonify({
+            "results":      results,
+            "generated_at": datetime.utcnow().isoformat(),
+        })
+
+    except Exception as e:
+        logger.error(f"[API] /sentiment error: {e}")
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
+
 @app.route("/update-weights", methods=["POST"])
 @require_auth
 def update_weights():

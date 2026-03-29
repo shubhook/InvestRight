@@ -83,7 +83,7 @@ function LoginScreen({ onLogin }) {
 // ---------------------------------------------------------------------------
 // NavBar
 // ---------------------------------------------------------------------------
-const TABS = ['Overview', 'Trade Setup', 'Portfolio', 'Trades', 'Backtest', 'Observability', 'Settings'];
+const TABS = ['Overview', 'Trade Setup', 'Market Sentiment', 'Portfolio', 'Trades', 'Backtest', 'Observability', 'Settings'];
 
 function NavBar({ activeTab, setActiveTab, killActive, onLogout }) {
   return (
@@ -1012,6 +1012,210 @@ function TradeSetupTab() {
 }
 
 // ---------------------------------------------------------------------------
+// Tab: Market Sentiment (Bullish vs Bearish)
+// ---------------------------------------------------------------------------
+
+function classifyStock(result) {
+  const p = result.probability_up ?? 0.5;
+  if (p > 0.55) return 'bullish';
+  if (p < 0.45) return 'bearish';
+  return 'neutral';
+}
+
+function SentimentSignalRow({ result }) {
+  const summary  = result.analysis_summary  || {};
+  const pattern  = result.pattern_detected  || {};
+  const pct      = Math.round((result.probability_up ?? 0.5) * 100);
+
+  const trendCls = t => t === 'uptrend'  ? 'bg-green-900 text-green-300'
+                      : t === 'downtrend' ? 'bg-red-900 text-red-300'
+                      : 'bg-gray-800 text-gray-400';
+  const sentCls  = s => s === 'positive' ? 'bg-green-900 text-green-300'
+                      : s === 'negative'  ? 'bg-red-900 text-red-300'
+                      : 'bg-gray-800 text-gray-400';
+  const volCls   = v => v > 0 ? 'text-green-400' : v < 0 ? 'text-red-400' : 'text-gray-400';
+  const barCls   = p => p > 55 ? 'bg-green-500' : p < 45 ? 'bg-red-500' : 'bg-gray-500';
+
+  return (
+    <div className="mt-2 space-y-2 text-xs">
+      {/* Signal badges */}
+      <div className="flex flex-wrap gap-1">
+        {summary.trend && (
+          <span className={`px-2 py-0.5 rounded-full font-medium ${trendCls(summary.trend)}`}>
+            {summary.trend}
+          </span>
+        )}
+        {summary.sentiment && (
+          <span className={`px-2 py-0.5 rounded-full font-medium ${sentCls(summary.sentiment)}`}>
+            {summary.sentiment}
+          </span>
+        )}
+        {pattern.pattern && pattern.pattern !== 'none' && (
+          <span className="px-2 py-0.5 rounded-full font-medium bg-indigo-900 text-indigo-300">
+            {pattern.pattern.replace(/_/g, ' ')} {Math.round((pattern.confidence ?? 0) * 100)}%
+          </span>
+        )}
+        {summary.volume_signal != null && (
+          <span className={`font-medium ${volCls(summary.volume_signal)}`}>
+            vol {summary.volume_signal > 0 ? '+' : ''}{Number(summary.volume_signal).toFixed(1)}
+          </span>
+        )}
+      </div>
+      {/* Probability bar */}
+      <div>
+        <div className="flex justify-between text-gray-400 mb-0.5">
+          <span>P(up)</span><span>{pct}%</span>
+        </div>
+        <div className="w-full bg-gray-800 rounded-full h-1.5">
+          <div className={`h-1.5 rounded-full ${barCls(pct)}`} style={{ width: `${pct}%` }} />
+        </div>
+      </div>
+      {/* Reason */}
+      {result.reason && (
+        <p className="text-gray-400 italic leading-snug">{result.reason}</p>
+      )}
+    </div>
+  );
+}
+
+function StockSentimentCard({ result }) {
+  const STATUS_MAP = { BUY: 'buy', SELL: 'sell', WAIT: 'wait' };
+  if (result.error) {
+    return (
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+        <p className="font-bold text-white">{result.symbol}</p>
+        <p className="text-red-400 text-xs mt-1">{result.error}</p>
+      </div>
+    );
+  }
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div className="flex items-center justify-between">
+        <p className="font-bold text-white">{result.symbol}</p>
+        <Badge status={STATUS_MAP[result.decision] || 'wait'}>{result.decision || 'WAIT'}</Badge>
+      </div>
+      <SentimentSignalRow result={result} />
+    </div>
+  );
+}
+
+function MarketSentimentTab() {
+  // This tab intentionally does not check the kill switch —
+  // reading market signals is always safe even when trading is halted.
+  const [results,     setResults]     = React.useState([]);
+  const [loading,     setLoading]     = React.useState(true);
+  const [error,       setError]       = React.useState('');
+  const [lastUpdated, setLastUpdated] = React.useState(null);
+
+  function load() {
+    setLoading(true);
+    setError('');
+    apiFetch('/sentiment')
+      .then(r => r.json())
+      .then(d => {
+        setResults(d.results || []);
+        setLastUpdated(new Date());
+      })
+      .catch(() => setError('Failed to load sentiment data.'))
+      .finally(() => setLoading(false));
+  }
+
+  React.useEffect(() => { load(); }, []);
+
+  const bullish = results.filter(r => !r.error && classifyStock(r) === 'bullish');
+  const bearish = results.filter(r => !r.error && classifyStock(r) === 'bearish');
+  const neutral = results.filter(r => !r.error && classifyStock(r) === 'neutral');
+
+  return (
+    <div className="p-6 space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-semibold text-white">Market Sentiment</h2>
+          {lastUpdated && (
+            <p className="text-xs text-gray-400 mt-0.5">
+              Last updated: {lastUpdated.toLocaleTimeString()}
+            </p>
+          )}
+        </div>
+        <button
+          onClick={load}
+          disabled={loading}
+          className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white text-sm rounded-lg"
+        >
+          {loading ? 'Loading…' : 'Refresh'}
+        </button>
+      </div>
+
+      {/* States */}
+      {loading && <div className="flex justify-center py-12"><Spinner /></div>}
+      {!loading && error && <p className="text-red-400">{error}</p>}
+      {!loading && !error && results.length === 0 && (
+        <p className="text-gray-400 text-sm">
+          No active symbols in your watchlist. Add stocks in the Trade Setup tab.
+        </p>
+      )}
+
+      {/* Bullish / Bearish columns */}
+      {!loading && !error && results.length > 0 && (
+        <div className="grid md:grid-cols-2 gap-6">
+          {/* Bullish column */}
+          <div>
+            <p className="text-xs font-semibold text-green-400 uppercase tracking-wider mb-3">
+              Bullish ({bullish.length})
+            </p>
+            {bullish.length === 0 ? (
+              <p className="text-gray-500 text-sm">None</p>
+            ) : (
+              <div className="space-y-3">
+                {bullish.map(r => <StockSentimentCard key={r.symbol} result={r} />)}
+              </div>
+            )}
+          </div>
+          {/* Bearish column */}
+          <div>
+            <p className="text-xs font-semibold text-red-400 uppercase tracking-wider mb-3">
+              Bearish ({bearish.length})
+            </p>
+            {bearish.length === 0 ? (
+              <p className="text-gray-500 text-sm">None</p>
+            ) : (
+              <div className="space-y-3">
+                {bearish.map(r => <StockSentimentCard key={r.symbol} result={r} />)}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Neutral row */}
+      {!loading && !error && neutral.length > 0 && (
+        <div>
+          <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
+            Neutral ({neutral.length})
+          </p>
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {neutral.map(r => <StockSentimentCard key={r.symbol} result={r} />)}
+          </div>
+        </div>
+      )}
+
+      {/* Error cards (fetch failures per symbol) */}
+      {!loading && results.some(r => r.error) && (
+        <div>
+          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">
+            Failed to fetch
+          </p>
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {results.filter(r => r.error).map(r => <StockSentimentCard key={r.symbol} result={r} />)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Tab: Settings
 // ---------------------------------------------------------------------------
 function SettingsTab({ health }) {
@@ -1225,8 +1429,9 @@ function App() {
       />
       <main className="flex-1 overflow-auto">
         {activeTab === 'Overview'       && <OverviewTab health={health} portfolio={portfolio} killActive={killActive} setKillActive={setKillActive} showModal={showModal} setShowModal={setShowModal} />}
-        {activeTab === 'Trade Setup'    && <TradeSetupTab />}
-        {activeTab === 'Portfolio'      && <PortfolioTab />}
+        {activeTab === 'Trade Setup'      && <TradeSetupTab />}
+        {activeTab === 'Market Sentiment' && <MarketSentimentTab />}
+        {activeTab === 'Portfolio'        && <PortfolioTab />}
         {activeTab === 'Trades'         && <TradesTab />}
         {activeTab === 'Backtest'       && <BacktestTab />}
         {activeTab === 'Observability'  && <ObservabilityTab />}

@@ -10,10 +10,16 @@ This document describes how data flows through the InvestRight AI trading system
 Stock Symbol
     │
     ▼
+[Auth]  JWT middleware — blocks unauthenticated requests
+    │
+    ▼
+[Safety] Kill switch check — halts pipeline if trading is paused
+    │
+    ▼
 [1] Data Agent          → Fetch OHLCV + news
     │
     ▼
-[2] Analysis Agent      → Extract signals (trend, S/R, ATR, sentiment, volume)
+[2] Analysis Agent      → Extract signals (trend, S/R, ATR, LLM sentiment, volume)
     │
     ▼
 [3] Pattern Engine      → Detect chart/momentum patterns
@@ -22,10 +28,16 @@ Stock Symbol
 [4] Decision Agent      → Compute P(up), EV → BUY / SELL / WAIT
     │
     ▼
+[LLM Review]            → Optional: Groq LLM review & explanation of decision
+    │
+    ▼
 [5] Risk Engine         → Set entry, stop loss, target, Kelly position size
     │
     ▼
-[6] Action Agent        → Store trade in memory.json
+[6] Action Agent        → Store trade; call broker to place order
+    │
+    ▼
+[Broker]                → PaperBroker (simulated) or KiteBroker (Zerodha live)
     │
     ▼
 [7] Feedback Agent      → Evaluate outcome → correct / wrong / pending
@@ -37,6 +49,33 @@ Stock Symbol
 ---
 
 ## Stage-by-Stage Breakdown
+
+### Auth — `backend/auth/`
+
+All protected endpoints require a Bearer JWT obtained from `POST /token`.
+
+- `POST /token` exchanges the `API_KEY` env var for a JWT (expiry set by `JWT_EXPIRY_HOURS`, default 24h).
+- `backend/auth/jwt_handler.py` generates and verifies tokens.
+- `backend/auth/middleware.py` provides the `@require_auth` decorator used on every protected route.
+- Public endpoints (no auth): `/health`, `/token`, `/kite/login`, `/kite/callback`.
+
+---
+
+### Safety — `backend/safety/`
+
+**Kill Switch** (`backend/safety/kill_switch.py`)
+- `POST /halt` immediately blocks all `/analyze` pipeline calls.
+- `POST /resume` restores normal operation.
+- Scheduler auto-activates the kill switch if model accuracy degrades below threshold (via `check_and_halt_if_degraded`).
+- Exit monitor is NOT blocked by the kill switch — positions can always be closed.
+
+**Capital Limits** (`backend/safety/capital_limits.py`)
+- Per-symbol capital allocation caps, synced from the watchlist table.
+
+**Idempotency** (`backend/safety/idempotency.py`)
+- Guards against duplicate order placement.
+
+---
 
 ### 1. Data Agent — `backend/agents/data_agent.py`
 
@@ -69,7 +108,7 @@ Returns `None` on failure, which halts the pipeline for that symbol.
 - **Trend:** SMA-20 vs SMA-50 crossover → `"uptrend"` or `"downtrend"`
 - **Support / Resistance:** Rolling window (size=10) local minima/maxima → lists of price levels
 - **Volatility:** 14-period ATR in price units
-- **Sentiment:** Weighted keyword scoring over news headlines. Positive and negative word lists have per-word weights (0.5–2.0). Threshold for classification: 0.05 normalized per headline.
+- **Sentiment:** First attempts LLM-based sentiment via Groq (`llm/sentiment_agent.py`); falls back to keyword scoring if GROQ_API_KEY is absent or call fails. `sentiment_source` field indicates `"llm"` or `"keyword"`.
 - **Volume Signal:** `(current_vol - avg_vol_20) / avg_vol_20`, clipped to `±2.0`
 
 **Output:**
@@ -80,6 +119,7 @@ Returns `None` on failure, which halts the pipeline for that symbol.
   "resistance": [105.30, 106.10, ...],
   "volatility": 1.25,          # ATR
   "sentiment": "positive" | "negative" | "neutral",
+  "sentiment_source": "llm" | "keyword",
   "volume_signal": 0.5
 }
 ```
@@ -126,7 +166,7 @@ All candidates with confidence ≥ 0.5 are collected; the highest-confidence can
 
 ### 4. Decision Agent — `backend/agents/decision_agent.py`
 
-**Input:** Analysis signals + pattern output
+**Input:** Analysis signals + pattern output + current price
 
 **What it does:**
 
@@ -177,9 +217,24 @@ else:
 
 ---
 
+### LLM Layer — `backend/llm/`
+
+Optional enrichment using the Groq API (`llama-3.1-8b-instant` by default, 30s timeout, no retries). All agents degrade gracefully — if `GROQ_API_KEY` is not set or the call fails, a rule-based fallback is used. Every call is logged to the `llm_calls` DB table.
+
+| Agent | File | When called | Purpose |
+|---|---|---|---|
+| Sentiment Agent | `llm/sentiment_agent.py` | Stage 2 (Analysis) | LLM-based news sentiment (replaces keyword fallback) |
+| Review Agent | `llm/review_agent.py` | After Stage 4 (Decision) | Validates decision logic |
+| Explanation Agent | `llm/explanation_agent.py` | After Stage 4 | Human-readable explanation of the trade thesis |
+| Summary Agent | `llm/summary_agent.py` | `/portfolio/summary`, `/portfolio/daily-brief` | LLM narrative of portfolio state |
+
+Central wrapper: `backend/llm/llm_client.py` — all agents call this, never the Groq API directly.
+
+---
+
 ### 5. Risk Engine — `backend/utils/risk_engine.py`
 
-**Input:** Decision output + analysis signals
+**Input:** Decision output + analysis signals + OHLCV data
 
 **What it does:**
 
@@ -224,7 +279,8 @@ else:
   - Generates a UUID `trade_id`
   - Creates a trade record (all risk params + `features_vector`)
   - Stores the record in `memory/memory.json` via `memory_store.py`
-  - Returns `executed=True` with `trade_id`
+  - Calls the active broker (`get_broker()`) to place a limit order
+  - Returns `executed=True` with `trade_id` and broker `order_id`
 
 **Stored trade structure:**
 ```python
@@ -245,6 +301,37 @@ else:
 
 ---
 
+### Broker Layer — `backend/broker/`
+
+Abstracted behind `broker/broker_factory.py` — the active broker is selected by the `BROKER_MODE` env var (`"paper"` or `"live"`). Mode can be toggled at runtime via `POST /broker/mode` without restarting.
+
+**PaperBroker** (`broker/paper_broker.py`)
+- Simulated broker — no real money, no external API calls.
+- Orders fill immediately at the limit/entry price; falls back to LTP from Redis cache or yfinance.
+- Order records are written to the `orders` DB table with `broker_mode = "paper"`.
+
+**KiteBroker** (`broker/kite_broker.py`)
+- Live broker using Zerodha KiteConnect API.
+- Requires `KITE_API_KEY`, `KITE_API_SECRET`, and a valid access token (stored/refreshed via `auth/kite_token_refresh.py`).
+- Supports `place_order`, `get_order_status`, `cancel_order`, `get_ltp`, `get_portfolio`.
+- Switching to live mode is blocked if no valid Kite token exists.
+
+**Zerodha OAuth Flow:**
+1. Frontend calls `GET /kite/login` → gets Zerodha login URL.
+2. User logs in on Zerodha; Zerodha redirects to `GET /kite/callback?request_token=XXX`.
+3. Backend exchanges `request_token` for `access_token` (KiteConnect `generate_session`).
+4. Token is persisted via `auth/kite_token_refresh.py`.
+
+**Order Management endpoints:**
+- `GET /orders` — list all orders
+- `GET /orders/<order_id>` — single order detail
+- `POST /orders/<order_id>/cancel` — cancel an open order
+- `GET /broker/status` — current broker mode + kill switch state
+- `POST /broker/mode` — switch between `"paper"` and `"live"`
+- `POST /broker/kite/token` — manually store a Kite access token
+
+---
+
 ### 7. Feedback Agent — `backend/agents/feedback_agent.py`
 
 **Input:** Current price for a previously executed trade
@@ -256,6 +343,7 @@ else:
   - Otherwise → `result = "pending"`
 - For SELL trades: logic is reversed.
 - Updates the trade record in `memory.json` with the result.
+- Also invoked by the Exit Monitor and manual position close flow.
 
 ---
 
@@ -285,22 +373,178 @@ Updated weights are persisted to `weights.json` and loaded at the start of each 
 
 ---
 
+## Portfolio Management — `backend/portfolio/`
+
+| Module | Purpose |
+|---|---|
+| `portfolio/position_manager.py` | Open/close positions; track entry price, quantity, status |
+| `portfolio/pnl_calculator.py` | Realised and unrealised P&L; daily snapshots; portfolio summary |
+| `portfolio/exit_monitor.py` | Checks open positions against stop loss / target every 15 min; triggers closes |
+| `portfolio/capital_account.py` | Capital allocation tracking |
+
+**Endpoints:**
+- `GET /portfolio` — full portfolio summary (capital, P&L, positions, trade stats)
+- `GET /portfolio/positions` — open positions with unrealised P&L
+- `GET /portfolio/positions/<id>` — single position detail
+- `POST /portfolio/positions/<id>/close` — manual close (not blocked by kill switch)
+- `GET /portfolio/live` — live holdings/positions from Zerodha (live mode only)
+- `GET /portfolio/pnl` — full P&L breakdown
+- `GET /portfolio/pnl/daily` — today's P&L
+- `GET /portfolio/summary` — LLM-generated portfolio narrative (`?timeframe=7d`)
+- `GET /portfolio/daily-brief` — LLM-generated daily trading brief
+
+---
+
+## Observability — `backend/observability/`
+
+Every pipeline run generates a `trace_id` (UUID). All stages log events to the `audit_log` DB table via `observability/audit_log.py`.
+
+| Module | Purpose |
+|---|---|
+| `observability/trace.py` | `TraceContext` — carries trace_id + elapsed time through pipeline stages |
+| `observability/audit_log.py` | Structured event logging to `audit_log` DB table |
+| `observability/metrics.py` | Per-component latency and success rate aggregates |
+
+**Endpoints:**
+- `GET /observability/trace/<trace_id>` — full event sequence for one pipeline run
+- `GET /observability/metrics?minutes=60` — per-component latency and success rates
+- `GET /observability/audit` — filtered audit log query (symbol, severity, event_type, since, limit)
+
+---
+
+## Backtesting — `backend/backtest/`
+
+Async backtest engine — runs in a background thread, results stored in the DB.
+
+| Module | Purpose |
+|---|---|
+| `backtest/data_loader.py` | Load historical OHLCV data for a date range |
+| `backtest/backtest_engine.py` | Replay the full pipeline (analysis → decision → risk) over historical data |
+| `backtest/walk_forward.py` | Walk-forward validation (time-series cross-validation, configurable splits) |
+| `backtest/performance.py` | Sharpe ratio, max drawdown, win rate, expectancy |
+| `backtest/report_generator.py` | Run summaries, trade breakdowns, equity curves, multi-run comparison |
+
+**Endpoints:**
+- `POST /backtest/run` — launch async backtest (returns `run_id` immediately)
+- `GET /backtest/runs` — list all runs (paginated)
+- `GET /backtest/runs/<run_id>` — full summary for one run
+- `GET /backtest/runs/<run_id>/trades` — trade-by-trade breakdown
+- `GET /backtest/runs/<run_id>/equity-curve` — equity curve data points
+- `POST /backtest/compare` — side-by-side comparison of multiple runs
+- `POST /backtest/walk-forward` — launch async walk-forward validation
+
+---
+
+## Model Health — `backend/feedback/model_monitor.py`
+
+- `compute_accuracy_window(n_days)` — computes accuracy and Brier score over the last N days of completed trades.
+- Accuracy and Brier score are included in the `GET /health` response under `model_health`.
+- Scheduler calls `check_and_halt_if_degraded()` every 15 min; auto-activates the kill switch if the model is unhealthy.
+
+---
+
+## Infrastructure
+
+### Database (PostgreSQL)
+- Persistent storage for orders, positions, P&L snapshots, backtest runs, audit log, LLM call log, watchlist, capital limits.
+- `backend/db/connection.py` — `db_cursor()` context manager.
+- `backend/db/init_db.py` — schema initialisation.
+- `database/schema.sql` — full schema.
+
+### Cache (Redis)
+- LTP (Last Traded Price) cache — 60s TTL, shared between PaperBroker and KiteBroker.
+- Rate limiting — sliding window per IP per endpoint.
+- `backend/cache/redis_client.py`.
+
+### Rate Limiting — `backend/utils/rate_limiter.py`
+- Applied on `/analyze`, `/backtest/run`, `/backtest/walk-forward`.
+- Per-IP sliding window; returns `Retry-After` headers on 429.
+
+### Maintenance — `backend/maintenance/`
+- `log_retention.py` — deletes aged rows from `audit_log`, `pipeline_metrics`, `llm_calls`, `rate_limit` tables. Runs daily at 02:00 IST.
+- `db_cleanup.py` — `ANALYZE` tables and reset stale backtest runs. Runs daily at 03:00 IST.
+
+---
+
 ## Execution Modes
 
 ### On-Demand (API)
 ```
 GET http://localhost:5001/analyze?symbol=RELIANCE.NS
+Authorization: Bearer <jwt>
 ```
-Runs the full pipeline (Stages 1–6) for one symbol and returns a JSON response.
+Runs the full pipeline (Stages 1–6 + Broker) for one symbol and returns a JSON response with `trace_id`.
+
+### Sentiment Scan (Read-Only)
+```
+GET http://localhost:5001/sentiment
+```
+Scans all active watchlist symbols concurrently (Stages 1–4 only). Does NOT execute trades or check the kill switch. Returns bullish/bearish signals for each symbol.
 
 ### Automated (Scheduler)
-`backend/scheduler.py` runs the pipeline every 15 minutes for all symbols defined in `config.py`. Runs once immediately on startup, then on schedule.
+`backend/scheduler.py` runs the following jobs:
+
+| Job | Frequency | Notes |
+|---|---|---|
+| Degradation check | Every 15 min | Auto-halts if model accuracy degrades |
+| Exit monitor | Every 15 min | Checks open positions against stop/target |
+| Watchlist analysis | Every 15 min | Reads active symbols from DB; market hours only |
+| Pending trade evaluation | Every 15 min | Updates result for pending trades; market hours only |
+| Daily P&L snapshot | Daily 15:30 IST | Records end-of-day portfolio state |
+| Log retention | Daily 02:00 IST | Purges aged audit/LLM/metrics rows |
+| DB cleanup | Daily 03:00 IST | ANALYZE + reset stale backtest runs |
+
+Symbols are read from the DB watchlist each cycle, so adding/removing symbols via the UI takes effect on the next run without a restart. Falls back to `Config.SYMBOLS` if the watchlist is empty.
 
 ### One-Command Startup
 ```bash
 ./run.sh
 ```
 Starts the Flask backend on port 5001 and the frontend on port 8080.
+
+---
+
+## API Endpoint Summary
+
+| Endpoint | Method | Auth | Purpose |
+|---|---|---|---|
+| `/health` | GET | No | System status (DB, Redis, kill switch, model health, Kite token) |
+| `/token` | POST | No | Exchange API key for JWT |
+| `/analyze` | GET | Yes | Full pipeline for one symbol |
+| `/sentiment` | GET | Yes | Read-only scan of all watchlist symbols |
+| `/update-weights` | POST | Yes | Trigger gradient-ascent weight update |
+| `/halt` | POST | Yes | Activate kill switch |
+| `/resume` | POST | Yes | Deactivate kill switch |
+| `/orders` | GET | Yes | List all orders |
+| `/orders/<id>` | GET | Yes | Single order detail |
+| `/orders/<id>/cancel` | POST | Yes | Cancel an open order |
+| `/broker/status` | GET | Yes | Broker mode + system state |
+| `/broker/mode` | POST | Yes | Switch paper ↔ live |
+| `/broker/kite/token` | POST | Yes | Store Kite access token |
+| `/kite/login` | GET | No | Get Zerodha OAuth login URL |
+| `/kite/callback` | GET | No | Zerodha OAuth callback |
+| `/watchlist` | GET | Yes | List watchlist |
+| `/watchlist` | POST | Yes | Add/update symbol in watchlist |
+| `/watchlist/<symbol>` | DELETE | Yes | Remove symbol from watchlist |
+| `/portfolio` | GET | Yes | Full portfolio summary |
+| `/portfolio/positions` | GET | Yes | Open positions + unrealised P&L |
+| `/portfolio/positions/<id>` | GET | Yes | Single position detail |
+| `/portfolio/positions/<id>/close` | POST | Yes | Manual position close |
+| `/portfolio/live` | GET | Yes | Live holdings from Zerodha |
+| `/portfolio/pnl` | GET | Yes | Full P&L breakdown |
+| `/portfolio/pnl/daily` | GET | Yes | Today's P&L |
+| `/portfolio/summary` | GET | Yes | LLM portfolio narrative |
+| `/portfolio/daily-brief` | GET | Yes | LLM daily brief |
+| `/observability/trace/<id>` | GET | Yes | Full trace event sequence |
+| `/observability/metrics` | GET | Yes | Per-component latency stats |
+| `/observability/audit` | GET | Yes | Filtered audit log query |
+| `/backtest/run` | POST | Yes | Launch async backtest |
+| `/backtest/runs` | GET | Yes | List backtest runs |
+| `/backtest/runs/<id>` | GET | Yes | Backtest run summary |
+| `/backtest/runs/<id>/trades` | GET | Yes | Trade breakdown |
+| `/backtest/runs/<id>/equity-curve` | GET | Yes | Equity curve |
+| `/backtest/compare` | POST | Yes | Compare multiple runs |
+| `/backtest/walk-forward` | POST | Yes | Launch walk-forward validation |
 
 ---
 
@@ -318,7 +562,46 @@ Starts the Flask backend on port 5001 and the frontend on port 8080.
 | `backend/agents/feedback_agent.py` | Stage 7 — outcome evaluation |
 | `backend/memory/weights_store.py` | Stage 8 — weight learning |
 | `backend/memory/memory_store.py` | Trade ledger (memory.json) |
+| `backend/memory/memory_reader.py` | Read-only trade queries |
+| `backend/llm/llm_client.py` | Central Groq API wrapper |
+| `backend/llm/sentiment_agent.py` | LLM news sentiment |
+| `backend/llm/review_agent.py` | LLM decision review |
+| `backend/llm/explanation_agent.py` | LLM trade explanation |
+| `backend/llm/summary_agent.py` | LLM portfolio narrative |
+| `backend/broker/base.py` | BaseBroker interface |
+| `backend/broker/broker_factory.py` | Selects active broker from BROKER_MODE |
+| `backend/broker/paper_broker.py` | Simulated broker (no real orders) |
+| `backend/broker/kite_broker.py` | Zerodha KiteConnect live broker |
+| `backend/broker/order_manager.py` | Order lifecycle helpers |
+| `backend/auth/jwt_handler.py` | JWT generation and verification |
+| `backend/auth/middleware.py` | `@require_auth` decorator |
+| `backend/auth/kite_token_refresh.py` | Kite access token storage/validation |
+| `backend/portfolio/position_manager.py` | Open/close position tracking |
+| `backend/portfolio/pnl_calculator.py` | Realised/unrealised P&L + snapshots |
+| `backend/portfolio/exit_monitor.py` | Automated stop/target exit checks |
+| `backend/portfolio/capital_account.py` | Capital allocation tracking |
+| `backend/safety/kill_switch.py` | Trading halt/resume |
+| `backend/safety/capital_limits.py` | Per-symbol capital caps |
+| `backend/safety/idempotency.py` | Duplicate order prevention |
+| `backend/observability/trace.py` | TraceContext — trace_id propagation |
+| `backend/observability/audit_log.py` | Structured event logging |
+| `backend/observability/metrics.py` | Component latency/success aggregates |
+| `backend/feedback/model_monitor.py` | Accuracy + Brier score monitoring |
+| `backend/backtest/backtest_engine.py` | Historical pipeline replay |
+| `backend/backtest/data_loader.py` | Historical OHLCV loader |
+| `backend/backtest/walk_forward.py` | Walk-forward validation |
+| `backend/backtest/performance.py` | Sharpe, drawdown, win rate |
+| `backend/backtest/report_generator.py` | Run summaries, equity curves, comparison |
+| `backend/db/connection.py` | PostgreSQL connection (db_cursor) |
+| `backend/db/init_db.py` | Schema initialisation |
+| `backend/cache/redis_client.py` | Redis LTP cache |
+| `backend/utils/rate_limiter.py` | Per-IP rate limiting (Redis) |
+| `backend/utils/market_hours.py` | NSE market hours check |
+| `backend/utils/logger.py` | Structured logging setup |
+| `backend/maintenance/log_retention.py` | Purge aged log rows |
+| `backend/maintenance/db_cleanup.py` | ANALYZE + stale run cleanup |
 | `backend/services/stock_service.py` | yfinance / Alpha Vantage fetcher |
 | `backend/services/news_service.py` | Google Finance RSS / NewsAPI fetcher |
-| `backend/scheduler.py` | Automated 15-min scheduler |
-| `frontend/script.js` | Web UI — calls /analyze and renders results |
+| `backend/scheduler.py` | Multi-job automated scheduler |
+| `backend/config.py` | Config + env var validation |
+| `frontend/app.js` | Web UI — dashboard, watchlist, portfolio, settings |
